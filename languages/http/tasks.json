@@ -1,0 +1,19 @@
+[
+  {
+    "label": "Send HTTP request",
+    "command": "httpyac",
+    "args": ["send", "--line", "$ZED_ROW", "$ZED_FILE"],
+    "cwd": "$ZED_DIRNAME",
+    "tags": ["http-request"],
+    "reveal": "always",
+    "save": "current"
+  },
+  {
+    "label": "Send all HTTP requests in file",
+    "command": "httpyac",
+    "args": ["send", "--all", "$ZED_FILE"],
+    "cwd": "$ZED_DIRNAME",
+    "reveal": "always",
+    "save": "current"
+  }
+]

@@ -1,35 +1,34 @@
-; Highlight HTTP methods
+; Requests and responses
 (method) @function.method
+(request url: (target_url) @string.special.url)
+(http_version) @constant
+(status_code) @number
+(status_text) @string
 
-; Highlight HTTP comments
-(comment) @comment
-
-; Highlight URLs and paths
-(target_url) @string.url
-(host) @string.url
-(path) @string.url
-
-; Highlight HTTP headers
-(header name: (name) @property)
+; Headers
+(header name: (header_entity) @property)
 (header value: (value) @string)
 
-; Highlight HTTP status codes and status texts
-(status_code) @constant.numeric
-(status_text) @constant.language
+; Variables and metadata
+(variable name: (identifier) @variable)
+(variable_declaration name: (identifier) @variable)
+(variable_declaration "=" @operator)
+(variable_declaration value: (value) @string)
+(comment "@" @keyword name: (identifier) @keyword)
+(comment "=" @operator)
+(request_separator value: (value) @label)
 
-; Highlight HTTP versions
-(http_version) @keyword
+; Bodies and file references
+(raw_body) @string
+(multipart_form_data) @string.special
+(external_body path: (path) @string.special.path)
+(pre_request_script (path) @string.special.path)
+(res_handler_script (path) @string.special.path)
+(res_redirect path: (path) @string.special.path)
 
-; Highlight variables and script variables
-(variable) @variable
-(script_variable) @variable.special
+; Punctuation
+["{{" "}}"] @punctuation.bracket
+(header ":" @punctuation.delimiter)
 
-; Highlight different types of request bodies
-(json_body) @string.special
-(xml_body) @string.special
-(graphql_body) @string.special
-(external_body) @string.special
-(form_data) @string.special
-
-; Highlight query parameters
-(query_param) @string
+; Comments and request separators
+[(comment) (request_separator)] @comment

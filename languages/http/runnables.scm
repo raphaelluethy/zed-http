@@ -1,9 +1,6 @@
-; HTTP request runnables for Zed editor
-; This enables running HTTP requests directly from .http files
-
+; The `http-request` tag wires these to the runnable task in tasks.json.
 (
   (request
-    (method) @run
-  ) @http-request
+    method: (method) @run) @request
   (#set! tag http-request)
 )
