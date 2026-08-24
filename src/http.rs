@@ -308,10 +308,6 @@ fn configured_httpyac_path(settings: Option<&zed::serde_json::Value>) -> Option<
         .map(str::to_owned)
 }
 
-fn requires_managed_httpyac(settings: Option<&zed::serde_json::Value>) -> bool {
-    configured_httpyac_path(settings).is_none()
-}
-
 fn set_env(env: &mut Vec<(String, String)>, key: String, value: String) {
     if let Some((_, existing_value)) = env
         .iter_mut()
