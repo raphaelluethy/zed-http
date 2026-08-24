@@ -1,0 +1,31 @@
+[
+    {
+        "label": "Run HTTP request at cursor",
+        "command": "node",
+        "args": [
+            "-e",
+            "\"const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),cp=require('node:child_process'),root=path.join(process.env.XDG_CACHE_HOME||path.join(os.homedir(),'.cache'),'zed-http','httpyac-6.16.7'),runner=path.join(root,'node_modules','httpyac','bin','httpyac.js');if(fs.existsSync(runner)===false){const install=cp.spawnSync(process.platform==='win32'?'npm.cmd':'npm',['install','--silent','--no-audit','--no-fund','--prefix',root,'httpyac@6.16.7'],{stdio:'inherit'});if(install.status!==0)process.exit(install.status??1)}const result=cp.spawnSync(process.execPath,[runner,...process.argv.slice(1)],{stdio:'inherit'});process.exit(result.status??1)\"",
+            "send",
+            "--line",
+            "$ZED_ROW",
+            "$ZED_FILE"
+        ],
+        "tags": ["http-request"],
+        "reveal": "always",
+        "save": "current",
+        "shell": { "program": "/bin/sh" }
+    },
+    {
+        "label": "Run all HTTP requests in file",
+        "command": "node",
+        "args": [
+            "-e",
+            "\"const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),cp=require('node:child_process'),root=path.join(process.env.XDG_CACHE_HOME||path.join(os.homedir(),'.cache'),'zed-http','httpyac-6.16.7'),runner=path.join(root,'node_modules','httpyac','bin','httpyac.js');if(fs.existsSync(runner)===false){const install=cp.spawnSync(process.platform==='win32'?'npm.cmd':'npm',['install','--silent','--no-audit','--no-fund','--prefix',root,'httpyac@6.16.7'],{stdio:'inherit'});if(install.status!==0)process.exit(install.status??1)}const result=cp.spawnSync(process.execPath,[runner,...process.argv.slice(1)],{stdio:'inherit'});process.exit(result.status??1)\"",
+            "send",
+            "$ZED_FILE"
+        ],
+        "reveal": "always",
+        "save": "current",
+        "shell": { "program": "/bin/sh" }
+    }
+]
