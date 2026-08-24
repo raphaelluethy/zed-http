@@ -1,12 +1,15 @@
 id = "http"
-name = "http"
-description = "Highlights .http files"
-version = "0.0.1"
+name = "HTTP"
+description = "Syntax highlighting and language-server support for .http files"
+version = "0.0.2"
 schema_version = 1
-authors = ["tylerhanson921@gmail.com"]
+authors = ["raphael@lty.gg"]
 repository = "https://github.com/tie304/zed-http"
-
 
 [grammars.http]
 repository = "https://github.com/rest-nvim/tree-sitter-http"
-commit = "e061995f0caf2fa30f68fa1fdf2c08bcbd4629a8"
+rev = "e061995f0caf2fa30f68fa1fdf2c08bcbd4629a8"
+
+[language_servers.kulala-ls]
+name = "Kulala HTTP Language Server"
+languages = ["http"]
