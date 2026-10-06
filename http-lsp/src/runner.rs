@@ -331,7 +331,6 @@ impl Runner {
                 formatted: Some("<response body not logged (@no-log)>".to_owned()),
                 content: None,
             });
-            execution.raw_body.clear();
         }
 
         if !block.handlers.is_empty() {
@@ -637,16 +636,7 @@ fn fill_response(execution: &mut Execution, response: &Response) -> Value {
     execution.timings = Some(Timings {
         total: Some(response.elapsed.as_secs_f64() * 1000.0),
     });
-    for (name, value) in &response.headers {
-        let value = Value::String(value.clone());
-        match execution.headers.get_mut(name) {
-            Some(Value::Array(values)) => values.push(value),
-            Some(existing) => *existing = Value::Array(vec![existing.take(), value]),
-            None => {
-                execution.headers.insert(name.clone(), value);
-            }
-        }
-    }
+    execution.headers = response.headers.clone();
 
     if let Some(formatted) = &response.formatted {
         execution.body = Some(Body {

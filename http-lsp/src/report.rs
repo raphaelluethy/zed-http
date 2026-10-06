@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt::Write as _};
+use std::fmt::Write as _;
 
 use http::StatusCode;
 use serde_json::Value;
@@ -53,12 +53,12 @@ pub struct Execution {
     /// The status line protocol, such as `HTTP/1.1`. Protocols without an HTTP status use it as
     /// the whole status line.
     pub http_version: String,
-    pub headers: BTreeMap<String, Value>,
+    /// Response headers in received order, duplicates included.
+    pub headers: Vec<(String, String)>,
     pub url: String,
     pub request: Option<ExecutedRequest>,
     pub timings: Option<Timings>,
     pub body: Option<Body>,
-    pub raw_body: String,
     pub error: Option<String>,
     pub warnings: Vec<String>,
     /// Informational lines, such as where a response redirect saved the body.
@@ -132,16 +132,7 @@ impl Execution {
             let _ = writeln!(output, "# {}", self.url);
         }
         for (name, value) in &self.headers {
-            match value {
-                Value::Array(values) => {
-                    for value in values {
-                        let _ = writeln!(output, "{name}: {}", value_text(value));
-                    }
-                }
-                value => {
-                    let _ = writeln!(output, "{name}: {}", value_text(value));
-                }
-            }
+            let _ = writeln!(output, "{name}: {value}");
         }
         self.render_body(view, output);
     }
@@ -154,8 +145,7 @@ impl Execution {
             .body
             .as_ref()
             .and_then(Body::text)
-            .filter(|body| !body.is_empty())
-            .or_else(|| (!self.raw_body.is_empty()).then_some(self.raw_body.as_str()));
+            .filter(|body| !body.is_empty());
         if let Some(body) = body {
             output.push('\n');
             output.push_str(body);
@@ -261,10 +251,11 @@ mod tests {
                     success: true,
                     status: Some(200),
                     http_version: "HTTP/1.1".to_owned(),
-                    headers: BTreeMap::from([(
-                        "content-type".to_owned(),
-                        json!("application/json"),
-                    )]),
+                    headers: vec![
+                        ("content-type".to_owned(), "application/json".to_owned()),
+                        ("set-cookie".to_owned(), "b=2".to_owned()),
+                        ("set-cookie".to_owned(), "a=1".to_owned()),
+                    ],
                     url: "https://example.test/users".to_owned(),
                     request: Some(ExecutedRequest {
                         method: "GET".to_owned(),
@@ -275,7 +266,6 @@ mod tests {
                         formatted: Some("{\n  \"ok\": true\n}".to_owned()),
                         content: Some(json!({ "ok": true })),
                     }),
-                    raw_body: "{\"ok\":true}".to_owned(),
                     block_name: "List users".to_owned(),
                     ..Execution::default()
                 },
@@ -302,7 +292,10 @@ mod tests {
         let output = report.render(OutputView::Full);
         assert!(output.contains("HTTP/1.1 200 OK"));
         assert!(output.contains("# 12 ms · https://example.test/users"));
-        assert!(output.contains("content-type: application/json"));
+        // Headers keep their received order and duplicates.
+        assert!(
+            output.contains("content-type: application/json\nset-cookie: b=2\nset-cookie: a=1\n")
+        );
         assert!(output.contains("\"ok\": true"));
         assert!(output.contains("error: connection refused"));
         assert!(!report
@@ -339,13 +332,19 @@ mod tests {
         let succeeded = Execution {
             success: true,
             http_version: "gRPC OK".to_owned(),
-            raw_body: "{}".to_owned(),
+            body: Some(Body {
+                formatted: Some("{}".to_owned()),
+                content: None,
+            }),
             ..Execution::default()
         };
         let failed = Execution {
             success: false,
             error: Some("connection reset".to_owned()),
-            raw_body: "← partial".to_owned(),
+            body: Some(Body {
+                formatted: Some("← partial".to_owned()),
+                content: None,
+            }),
             ..Execution::default()
         };
         let report = Report {

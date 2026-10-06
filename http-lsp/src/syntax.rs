@@ -92,6 +92,7 @@ impl RequestBlock {
         (self.first_line..=self.last_line).contains(&line)
     }
 
+    #[cfg(test)]
     pub fn header(&self, name: &str) -> Option<&str> {
         find_header(&self.headers, name)
     }

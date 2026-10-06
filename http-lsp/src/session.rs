@@ -67,6 +67,7 @@ impl Session {
         lock(&self.responses).insert(name.to_owned(), Arc::new(response));
     }
 
+    #[cfg(test)]
     pub fn response(&self, name: &str) -> Option<Arc<NamedResponse>> {
         lock(&self.responses).get(name).cloned()
     }
