@@ -18,6 +18,10 @@ pub const PUBLIC_ENV_FILE: &str = "http-client.env.json";
 pub const PRIVATE_ENV_FILE: &str = "http-client.private.env.json";
 const SHARED: &str = "$shared";
 const MAX_DEPTH: usize = 16;
+/// Bytes one substitution may produce through variable values, counted at every nesting level
+/// before they are copied, so fan-out (each value referencing the next many times) cannot
+/// exhaust memory.
+pub const MAX_EXPANSION_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ENV_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The selected environment, with `$shared` and private values already merged in.
@@ -147,6 +151,21 @@ pub struct Substitution {
     pub text: String,
     /// Names left verbatim because they did not resolve, in first-seen order.
     pub unresolved: Vec<String>,
+    /// Set when expansion exceeded [`MAX_EXPANSION_BYTES`]; `text` is then the input unchanged.
+    pub error: Option<String>,
+}
+
+struct Expansion {
+    stack: Vec<String>,
+    unresolved: Vec<String>,
+    budget: usize,
+}
+
+impl Expansion {
+    fn spend(&mut self, bytes: usize) -> Result<(), ()> {
+        self.budget = self.budget.checked_sub(bytes).ok_or(())?;
+        Ok(())
+    }
 }
 
 impl Variables {
@@ -201,18 +220,39 @@ impl Variables {
     /// Replaces every `{{name}}`. Resolved values are substituted recursively; dynamic variables
     /// are evaluated per occurrence.
     pub fn substitute(&self, text: &str) -> Substitution {
-        let mut unresolved = Vec::new();
-        let text = self.expand(text, &mut Vec::new(), &mut unresolved);
-        Substitution { text, unresolved }
+        let mut expansion = Expansion {
+            stack: Vec::new(),
+            unresolved: Vec::new(),
+            budget: MAX_EXPANSION_BYTES,
+        };
+        match self.expand(text, &mut expansion) {
+            Ok(expanded) => Substitution {
+                text: expanded,
+                unresolved: expansion.unresolved,
+                error: None,
+            },
+            Err(()) => Substitution {
+                text: text.to_owned(),
+                unresolved: Vec::new(),
+                error: Some(format!(
+                    "variables expand to more than {} MiB",
+                    MAX_EXPANSION_BYTES / 1024 / 1024
+                )),
+            },
+        }
     }
 
-    fn expand(&self, text: &str, stack: &mut Vec<String>, unresolved: &mut Vec<String>) -> String {
-        let mut output = String::with_capacity(text.len());
+    fn expand(&self, text: &str, expansion: &mut Expansion) -> Result<String, ()> {
+        let nested = !expansion.stack.is_empty();
+        let mut output = String::new();
         let mut rest = text;
         while let Some(start) = rest.find("{{") {
             let Some(length) = rest[start + 2..].find("}}") else {
                 break;
             };
+            if nested {
+                expansion.spend(start)?;
+            }
             output.push_str(&rest[..start]);
             let raw = &rest[start..start + 2 + length + 2];
             let name = rest[start + 2..start + 2 + length].trim();
@@ -220,28 +260,39 @@ impl Variables {
 
             let value = if name.starts_with('$') {
                 dynamic_variable(name)
-            } else if stack.iter().any(|seen| seen == name) || stack.len() >= MAX_DEPTH {
+            } else if expansion.stack.iter().any(|seen| seen == name)
+                || expansion.stack.len() >= MAX_DEPTH
+            {
                 None
             } else {
-                self.lookup(name).map(|value| {
-                    stack.push(name.to_owned());
-                    let value = self.expand(&value, stack, unresolved);
-                    stack.pop();
-                    value
-                })
+                match self.lookup(name) {
+                    Some(value) => {
+                        expansion.stack.push(name.to_owned());
+                        let value = self.expand(&value, expansion);
+                        expansion.stack.pop();
+                        Some(value?)
+                    }
+                    None => None,
+                }
             };
             match value {
-                Some(value) => output.push_str(&value),
+                Some(value) => {
+                    expansion.spend(value.len())?;
+                    output.push_str(&value);
+                }
                 None => {
-                    if !unresolved.iter().any(|seen| seen == name) {
-                        unresolved.push(name.to_owned());
+                    if !expansion.unresolved.iter().any(|seen| seen == name) {
+                        expansion.unresolved.push(name.to_owned());
                     }
                     output.push_str(raw);
                 }
             }
         }
+        if nested {
+            expansion.spend(rest.len())?;
+        }
         output.push_str(rest);
-        output
+        Ok(output)
     }
 }
 
@@ -503,6 +554,31 @@ mod tests {
             variables.lookup("login.response.body.*").as_deref(),
             Some(r#"{"token":"abc","items":[{"id":1},{"id":2}]}"#)
         );
+    }
+
+    #[test]
+    fn bounds_fan_out_expansion() {
+        // Each level references the next 32 times: 32^10 copies without a budget.
+        let mut file = BTreeMap::new();
+        for level in 0..10 {
+            file.insert(
+                format!("v{level}"),
+                format!("{{{{v{}}}}}", level + 1).repeat(32),
+            );
+        }
+        file.insert("v10".to_owned(), "x".repeat(64));
+        let variables = Variables {
+            file,
+            ..Variables::default()
+        };
+        let result = variables.substitute("start {{v0}}");
+        assert_eq!(result.text, "start {{v0}}");
+        assert!(result.error.unwrap().contains("MiB"));
+
+        // Large but bounded expansions still work.
+        let result = variables.substitute("{{v8}}");
+        assert_eq!(result.error, None);
+        assert_eq!(result.text.len(), 32 * 32 * 64);
     }
 
     #[test]

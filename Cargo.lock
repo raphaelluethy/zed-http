@@ -3144,6 +3144,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "boa_engine",
+ "encoding_rs",
  "fastrand",
  "http",
  "md-5",

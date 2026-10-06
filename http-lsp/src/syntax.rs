@@ -170,6 +170,10 @@ pub fn parse(text: &str) -> Document {
     for (index, line) in text.lines().enumerate() {
         parser.line(index as u32, line);
     }
+    // `lines()` drops a trailing empty line, but the cursor can sit there; the last block
+    // extends to it.
+    let line_count = text.matches('\n').count() as u32;
+    parser.last_line = parser.last_line.max(line_count);
     parser.finish()
 }
 
@@ -193,6 +197,69 @@ struct OpenScript {
     kind: ScriptKind,
     line: u32,
     source: String,
+    lexer: JsLexer,
+}
+
+/// Just enough JavaScript lexing to find the closing `%}` outside strings, template literals
+/// and comments. Regular expression literals are not recognised.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum JsLexer {
+    #[default]
+    Code,
+    Quoted(u8),
+    Template,
+    BlockComment,
+}
+
+impl JsLexer {
+    /// Returns the offset of a closing `%}` in code, carrying the state over to the next line.
+    fn find_close(&mut self, line: &str) -> Option<usize> {
+        let bytes = line.as_bytes();
+        let mut index = 0;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            let next = bytes.get(index + 1).copied();
+            match *self {
+                JsLexer::Code => match (byte, next) {
+                    (b'%', Some(b'}')) => return Some(index),
+                    (b'\'' | b'"', _) => *self = JsLexer::Quoted(byte),
+                    (b'`', _) => *self = JsLexer::Template,
+                    (b'/', Some(b'/')) => break,
+                    (b'/', Some(b'*')) => {
+                        *self = JsLexer::BlockComment;
+                        index += 1;
+                    }
+                    _ => {}
+                },
+                JsLexer::Quoted(quote) => {
+                    if byte == b'\\' {
+                        index += 1;
+                    } else if byte == quote {
+                        *self = JsLexer::Code;
+                    }
+                }
+                JsLexer::Template => {
+                    if byte == b'\\' {
+                        index += 1;
+                    } else if byte == b'`' {
+                        *self = JsLexer::Code;
+                    }
+                }
+                JsLexer::BlockComment => {
+                    if byte == b'*' && next == Some(b'/') {
+                        *self = JsLexer::Code;
+                        index += 1;
+                    }
+                }
+            }
+            index += 1;
+        }
+        // Quoted strings cannot span lines.
+        if matches!(self, JsLexer::Quoted(_)) {
+            *self = JsLexer::Code;
+        }
+        None
+    }
 }
 
 #[derive(Default)]
@@ -233,7 +300,7 @@ impl Parser {
         self.last_line = index;
         // `###` and directives inside `{% %}` belong to the script.
         if let Some(script) = self.script.as_mut() {
-            match line.find("%}") {
+            match script.lexer.find_close(line) {
                 Some(end) => {
                     script.source.push_str(&line[..end]);
                     let script = self.script.take().expect("script is open");
@@ -447,17 +514,20 @@ impl Parser {
     }
 
     fn open_script(&mut self, kind: ScriptKind, line: u32, rest: &str) {
-        let script = match rest.find("%}") {
+        let mut lexer = JsLexer::default();
+        let script = match lexer.find_close(rest) {
             Some(end) => OpenScript {
                 kind,
                 line,
                 source: rest[..end].to_owned(),
+                lexer,
             },
             None => {
                 self.script = Some(OpenScript {
                     kind,
                     line,
                     source: format!("{rest}\n"),
+                    lexer,
                 });
                 return;
             }
@@ -704,9 +774,14 @@ fn parse_parts(lines: &[String]) -> Vec<BodyPart> {
         }
     };
     for line in lines {
+        // Whitespace must follow, so `<@mention>` and `<tag>` stay text.
         let include = match line.strip_prefix("<@") {
-            Some(path) => Some((path.trim(), true)),
-            None => line.strip_prefix("< ").map(|path| (path.trim(), false)),
+            Some(path) if path.starts_with([' ', '\t']) => Some((path.trim(), true)),
+            Some(_) => None,
+            None => line
+                .strip_prefix('<')
+                .filter(|path| path.starts_with([' ', '\t']))
+                .map(|path| (path.trim(), false)),
         };
         match include {
             Some((path, substitute)) if !path.is_empty() => {
@@ -761,7 +836,7 @@ mod tests {
         assert_eq!(blocks[2].name.as_deref(), Some("commentName"));
         assert_eq!(blocks[3].name.as_deref(), Some("equalsName"));
         assert_eq!(blocks[3].method, "PURGE");
-        assert_eq!(blocks[3].last_line, 22);
+        assert_eq!(blocks[3].last_line, 23);
         assert!(blocks[3].contains(blocks[3].first_line));
         assert_eq!(
             document.block_at(17).map(|block| block.start_line),
@@ -834,13 +909,25 @@ mod tests {
                 substitute: false
             }]
         );
+
+        // `<@mention>` and `<tag>` are text; `<@ path` needs the space.
+        assert_eq!(
+            document.blocks[3].body,
+            Body::Parts(vec![
+                BodyPart::Text("<@mention> hello\n<tag attr=\"1\"/>".to_owned()),
+                BodyPart::File {
+                    path: "template.json".to_owned(),
+                    substitute: true
+                },
+            ])
+        );
     }
 
     #[test]
     fn parses_scripts_handlers_and_redirects() {
         let document = parse(include_str!("../tests/fixtures/scripts.http"));
         assert!(document.errors.is_empty(), "{:?}", document.errors);
-        assert_eq!(document.blocks.len(), 2);
+        assert_eq!(document.blocks.len(), 3);
         let block = &document.blocks[0];
         assert_eq!(block.pre_scripts.len(), 2);
         let Script::Inline { source, line } = &block.pre_scripts[0] else {
@@ -882,6 +969,33 @@ mod tests {
                 overwrite: false
             })
         );
+    }
+
+    #[test]
+    fn ignores_script_delimiters_in_strings_and_comments() {
+        let document = parse(include_str!("../tests/fixtures/scripts.http"));
+        let block = &document.blocks[2];
+        assert_eq!(block.handlers.len(), 1);
+        let Script::Inline { source, .. } = &block.handlers[0] else {
+            panic!("expected an inline handler");
+        };
+        assert!(source.starts_with("client.log(\"%}\");"), "{source}");
+        assert!(source.ends_with("client.log(\"done\")"), "{source}");
+        assert!(source.contains("`a\n%}`"), "{source}");
+    }
+
+    #[test]
+    fn last_block_extends_to_the_final_empty_line() {
+        for text in [
+            "GET http://x\n",
+            "GET http://x\r\n",
+            "###\nGET http://x\n\n",
+        ] {
+            let document = parse(text);
+            let last = text.matches('\n').count() as u32;
+            assert_eq!(document.blocks[0].last_line, last, "{text:?}");
+            assert!(document.block_at(last).is_some(), "{text:?}");
+        }
     }
 
     #[test]

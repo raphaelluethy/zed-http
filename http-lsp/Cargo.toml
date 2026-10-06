@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 base64 = "0.22"
 boa_engine = { version = "0.22", default-features = false }
+encoding_rs = "0.8"
 fastrand = "2"
 http = "1"
 md-5 = "0.10"

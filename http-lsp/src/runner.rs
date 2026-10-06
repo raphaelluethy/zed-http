@@ -80,11 +80,15 @@ struct RunContext<'a> {
 
 impl Runner {
     pub fn new(session: Arc<Session>) -> Self {
+        Self::with_scripts(session, ScriptEngine::default())
+    }
+
+    pub fn with_scripts(session: Arc<Session>, scripts: ScriptEngine) -> Self {
         let http = Clients::new(session.cookies());
         Self {
             session,
             http,
-            scripts: ScriptEngine::default(),
+            scripts,
             workspace_roots: RwLock::new(Vec::new()),
         }
     }
@@ -563,8 +567,12 @@ fn prepare(
     base_dir: &Path,
     unresolved: &mut Vec<String>,
 ) -> Result<PreparedRequest, String> {
+    let mut failure = None;
     let mut substitute = |text: &str| {
         let result = variables.substitute(text);
+        if let Some(error) = result.error {
+            failure.get_or_insert(error);
+        }
         for name in result.unresolved {
             if !unresolved.contains(&name) {
                 unresolved.push(name);
@@ -582,6 +590,9 @@ fn prepare(
         })
         .collect();
     let body = body::prepare(&block.body, base_dir, &mut substitute)?;
+    if let Some(error) = failure {
+        return Err(error);
+    }
     let request = PreparedRequest {
         method: block.method.clone(),
         url,
@@ -625,10 +636,14 @@ fn fill_response(execution: &mut Execution, response: &Response) -> Value {
         });
         return Value::String(String::from_utf8_lossy(&response.body).into_owned());
     }
-    let (formatted, content) = format_body(&response.body, response.content_type.as_deref());
-    let value = content
-        .clone()
-        .unwrap_or_else(|| Value::String(String::from_utf8_lossy(&response.body).into_owned()));
+    let content_type = response.content_type.as_deref();
+    let (formatted, content) = format_body(&response.body, content_type);
+    let value = content.clone().unwrap_or_else(|| {
+        Value::String(
+            decode_text(&response.body, content_type)
+                .unwrap_or_else(|| String::from_utf8_lossy(&response.body).into_owned()),
+        )
+    });
     execution.body = Some(Body { formatted, content });
     value
 }
@@ -638,15 +653,16 @@ pub fn format_body(body: &[u8], content_type: Option<&str>) -> (Option<String>, 
     if body.is_empty() {
         return (None, None);
     }
+    let text = decode_text(body, content_type);
     if content_type.is_some_and(is_json) {
-        if let Ok(value) = serde_json::from_slice::<Value>(body) {
+        if let Some(Ok(value)) = text.as_deref().map(serde_json::from_str::<Value>) {
             let formatted = serde_json::to_string_pretty(&value).ok();
             return (formatted, Some(value));
         }
     }
-    match std::str::from_utf8(body) {
-        Ok(text) => (Some(text.to_owned()), None),
-        Err(_) => (
+    match text {
+        Some(text) => (Some(text), None),
+        None => (
             Some(format!(
                 "<binary {} bytes, {}>",
                 body.len(),
@@ -654,6 +670,23 @@ pub fn format_body(body: &[u8], content_type: Option<&str>) -> (Option<String>, 
             )),
             None,
         ),
+    }
+}
+
+/// Decodes text in the declared charset, or as UTF-8 when none is declared. `None` means the
+/// body is not text.
+pub fn decode_text(body: &[u8], content_type: Option<&str>) -> Option<String> {
+    let charset = content_type.and_then(|content_type| {
+        content_type.split(';').skip(1).find_map(|parameter| {
+            let (name, value) = parameter.split_once('=')?;
+            name.trim()
+                .eq_ignore_ascii_case("charset")
+                .then(|| value.trim().trim_matches('"'))
+        })
+    });
+    match charset.and_then(|label| encoding_rs::Encoding::for_label(label.as_bytes())) {
+        Some(encoding) => Some(encoding.decode_without_bom_handling(body).0.into_owned()),
+        None => std::str::from_utf8(body).ok().map(str::to_owned),
     }
 }
 
@@ -689,6 +722,20 @@ mod tests {
                 .0
                 .as_deref(),
             Some("<binary 3 bytes, image/png>")
+        );
+        assert_eq!(
+            format_body(b"caf\xe9", Some("text/plain; charset=ISO-8859-1"))
+                .0
+                .as_deref(),
+            Some("café")
+        );
+        assert_eq!(
+            format_body(
+                b"{\"a\":\"\xe9\"}",
+                Some("application/json; charset=\"latin1\"")
+            )
+            .1,
+            Some(json!({ "a": "é" }))
         );
         assert!(is_json("application/problem+json"));
         assert!(!is_json("text/json-ish"));

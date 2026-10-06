@@ -18,3 +18,9 @@ GET https://example.test/second
   client.test("ok", () => client.assert(response.status === 200));
 %}
 >> ./second.json
+
+### Delimiters in strings
+GET https://example.test/third
+> {% client.log("%}"); client.log('%}'); /* %} */ client.log(`a
+%}`); // %}
+client.log("done") %}

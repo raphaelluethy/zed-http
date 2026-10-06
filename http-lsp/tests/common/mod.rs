@@ -19,7 +19,17 @@ use axum::{
 };
 use serde_json::{json, Value};
 use tower_http::compression::CompressionLayer;
-use zed_http_lsp::{report::Report, runner::Runner, session::Session};
+use zed_http_lsp::{
+    report::Report,
+    runner::Runner,
+    script::{Limits, ScriptEngine},
+    session::Session,
+};
+
+/// Script workers are the real binary; the test executable cannot act as one.
+pub fn script_engine(limits: Limits) -> ScriptEngine {
+    ScriptEngine::new(limits, PathBuf::from(env!("CARGO_BIN_EXE_zed-http-lsp")))
+}
 
 pub async fn start_server() -> SocketAddr {
     let compressed = Router::new()
@@ -65,6 +75,15 @@ pub async fn start_server() -> SocketAddr {
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or("none")
                     .to_owned()
+            }),
+        )
+        .route(
+            "/latin1",
+            get(|| async {
+                (
+                    [(header::CONTENT_TYPE, "text/plain; charset=iso-8859-1")],
+                    b"caf\xe9".to_vec(),
+                )
             }),
         )
         .route(
@@ -160,7 +179,7 @@ impl Workspace {
     }
 
     pub fn runner(&self) -> Runner {
-        let runner = Runner::new(Session::new());
+        let runner = Runner::with_scripts(Session::new(), script_engine(Limits::default()));
         runner.set_workspace_roots(vec![self.root.clone()]);
         runner
     }

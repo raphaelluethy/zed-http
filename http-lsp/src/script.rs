@@ -1,13 +1,22 @@
 //! Pre-request scripts and response handlers on the embedded Boa JavaScript engine, with the
 //! IntelliJ `client` / `request` / `response` API.
 //!
-//! Boa contexts are `!Send`, so every script gets a fresh context on a blocking thread and only
-//! JSON crosses the boundary. Boa's runtime limits (loop iterations per call frame, recursion)
-//! stop runaway scripts. Boa has no interrupt hook, so the wall-clock guard can only abandon a
-//! script's result; its thread keeps its worker permit until the runtime limits end it.
-//! Scripts get no filesystem or network access.
+//! Every script runs in a fresh Boa context inside a short-lived worker process: this same
+//! executable started with [`WORKER_FLAG`], with JSON on stdin and [`ScriptEffects`] JSON on
+//! stdout. Boa has no interrupt hook and its loop limit is per call frame, so nested loops can
+//! outlast any in-process guard; a worker past the wall clock is killed instead. Boa's runtime
+//! limits (loop iterations, recursion) still end most runaway scripts early. Scripts get no
+//! filesystem, network or environment access.
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    env,
+    io::{self, Read as _, Write as _},
+    path::PathBuf,
+    process::Stdio,
+    sync::Arc,
+    time::Duration,
+};
 
 use base64::Engine as _;
 use boa_engine::{
@@ -20,7 +29,12 @@ use serde_json::Value;
 use serde_json_path::JsonPath;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
-use tokio::{sync::Semaphore, time::timeout};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    sync::Semaphore,
+    time::timeout,
+};
 
 use crate::{session::GlobalChange, variables::dynamic_variable};
 
@@ -28,8 +42,13 @@ const PRELUDE: &str = include_str!("script_prelude.js");
 pub const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_EFFECTS_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONCURRENT_SCRIPTS: usize = 2;
+const MAX_WORKER_INPUT_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_WORKER_DIAGNOSTICS: u64 = 64 * 1024;
+/// The first argument that turns the executable into a script worker.
+pub const WORKER_FLAG: &str = "--script-worker";
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Limits {
     pub wall_clock: Duration,
     pub loop_iterations: u64,
@@ -76,7 +95,7 @@ pub struct ScriptResponse {
 
 /// Everything a script did, for the runner to apply. Effects made before an exception are kept
 /// and `error` is set.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ScriptEffects {
     /// `client.global` mutations in call order.
     pub globals: Vec<GlobalChange>,
@@ -88,13 +107,13 @@ pub struct ScriptEffects {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptLog {
     pub level: String,
     pub message: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScriptTest {
     pub name: String,
     pub passed: bool,
@@ -113,19 +132,33 @@ impl ScriptEffects {
 
 pub struct ScriptEngine {
     limits: Limits,
+    worker: PathBuf,
     workers: Arc<Semaphore>,
 }
 
 impl Default for ScriptEngine {
+    /// Uses the running executable as the worker.
     fn default() -> Self {
-        Self::new(Limits::default())
+        let worker = env::current_exe().unwrap_or_else(|_| PathBuf::from("zed-http-lsp"));
+        Self::new(Limits::default(), worker)
     }
 }
 
+/// What the parent sends a worker on stdin.
+#[derive(Serialize, Deserialize)]
+struct WorkerRequest {
+    source: String,
+    /// The JSON-encoded [`ScriptInput`].
+    input: String,
+    limits: Limits,
+}
+
 impl ScriptEngine {
-    pub fn new(limits: Limits) -> Self {
+    /// `worker` is an executable that runs [`worker_main`] when given [`WORKER_FLAG`].
+    pub fn new(limits: Limits, worker: PathBuf) -> Self {
         Self {
             limits,
+            worker,
             workers: Arc::new(Semaphore::new(MAX_CONCURRENT_SCRIPTS)),
         }
     }
@@ -137,31 +170,122 @@ impl ScriptEngine {
                 MAX_SOURCE_BYTES / 1024
             ));
         }
-        let input = match serde_json::to_string(input) {
-            Ok(input) => input,
+        let request = serde_json::to_string(input).and_then(|input| {
+            serde_json::to_vec(&WorkerRequest {
+                source,
+                input,
+                limits: self.limits,
+            })
+        });
+        let request = match request {
+            Ok(request) => request,
             Err(error) => return ScriptEffects::failed(format!("failed to encode input: {error}")),
         };
-        let limits = self.limits;
-        let workers = Arc::clone(&self.workers);
-        let task = async move {
-            let permit = workers
-                .acquire_owned()
-                .await
-                .map_err(|_| "script workers are shut down".to_owned())?;
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                evaluate(&source, input, limits)
-            })
-            .await
-            .map_err(|error| format!("script worker failed: {error}"))
+        let Ok(_permit) = self.workers.acquire().await else {
+            return ScriptEffects::failed("script workers are shut down");
         };
-        match timeout(limits.wall_clock, task).await {
+        // Dropping the future on timeout drops the child, which kills it.
+        match timeout(self.limits.wall_clock, self.run_worker(request)).await {
             Ok(Ok(effects)) => effects,
             Ok(Err(error)) => ScriptEffects::failed(error),
             Err(_) => ScriptEffects::failed(format!(
-                "script exceeded the {} second time limit; its effects were discarded",
-                limits.wall_clock.as_secs_f64()
+                "script exceeded the {} second time limit and was stopped; its effects were discarded",
+                self.limits.wall_clock.as_secs_f64()
             )),
+        }
+    }
+
+    async fn run_worker(&self, request: Vec<u8>) -> Result<ScriptEffects, String> {
+        let mut child = Command::new(&self.worker)
+            .arg(WORKER_FLAG)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|error| {
+                format!(
+                    "failed to start the script worker {}: {error}",
+                    self.worker.display()
+                )
+            })?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or("failed to open the worker's stdin")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("failed to read the worker's stdout")?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or("failed to read the worker's stderr")?;
+
+        let write = async move {
+            // A worker that exits early explains itself through its status and stderr.
+            let _ = stdin.write_all(&request).await;
+            let _ = stdin.shutdown().await;
+        };
+        let mut output = Vec::new();
+        let mut diagnostics = Vec::new();
+        let mut stdout = stdout.take(MAX_EFFECTS_BYTES as u64 + 1);
+        let mut stderr = stderr.take(MAX_WORKER_DIAGNOSTICS);
+        let read_output = stdout.read_to_end(&mut output);
+        let read_diagnostics = stderr.read_to_end(&mut diagnostics);
+        let (_, read_output, read_diagnostics) = tokio::join!(write, read_output, read_diagnostics);
+        read_output.map_err(|error| format!("failed to read script results: {error}"))?;
+        let _ = read_diagnostics;
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| format!("failed to wait for the script worker: {error}"))?;
+
+        if output.len() > MAX_EFFECTS_BYTES {
+            return Err("script results are larger than 16 MiB".to_owned());
+        }
+        if !status.success() {
+            let diagnostics = String::from_utf8_lossy(&diagnostics);
+            let diagnostics = diagnostics.trim();
+            return Err(if diagnostics.is_empty() {
+                format!("script worker exited with {status}")
+            } else {
+                format!("script worker exited with {status}: {diagnostics}")
+            });
+        }
+        serde_json::from_slice(&output)
+            .map_err(|error| format!("script worker returned invalid results: {error}"))
+    }
+}
+
+/// Entry point of a worker process: reads a request from stdin, writes effects to stdout and
+/// returns the exit code.
+pub fn worker_main() -> i32 {
+    let mut request = Vec::new();
+    if let Err(error) = io::stdin()
+        .take(MAX_WORKER_INPUT_BYTES)
+        .read_to_end(&mut request)
+    {
+        eprintln!("failed to read the script request: {error}");
+        return 2;
+    }
+    let request: WorkerRequest = match serde_json::from_slice(&request) {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("invalid script request: {error}");
+            return 2;
+        }
+    };
+    let effects = evaluate(&request.source, request.input, request.limits);
+    let mut stdout = io::stdout().lock();
+    let written = serde_json::to_writer(&mut stdout, &effects)
+        .map_err(io::Error::from)
+        .and_then(|()| stdout.flush());
+    match written {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("failed to write script results: {error}");
+            2
         }
     }
 }
@@ -184,8 +308,8 @@ enum RawGlobalChange {
     ClearAll,
 }
 
-/// Runs on a blocking thread; every Boa object is created and dropped here.
-fn evaluate(source: &str, input: String, limits: Limits) -> ScriptEffects {
+/// Evaluates one script in a fresh context. Runs in a worker process.
+pub fn evaluate(source: &str, input: String, limits: Limits) -> ScriptEffects {
     let mut context = Context::default();
     let runtime_limits = context.runtime_limits_mut();
     runtime_limits.set_loop_iteration_limit(limits.loop_iterations);
@@ -327,9 +451,13 @@ fn json_path(_: &JsValue, arguments: &[JsValue], context: &mut Context) -> JsRes
     Ok(JsString::from(matches.as_str()).into())
 }
 
-/// `__zedHttpDynamic(name)` → the value of a `{{$…}}` dynamic variable, or `undefined`.
+/// `__zedHttpDynamic(name)` → the value of a `$random.*` dynamic variable, or `undefined`.
+/// Environment lookups (`$env`, `$processEnv`) are deliberately not reachable from scripts.
 fn dynamic(_: &JsValue, arguments: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let name = string_argument(arguments, 0, context)?;
+    if !name.starts_with("$random.") {
+        return Ok(JsValue::undefined());
+    }
     Ok(dynamic_variable(&name)
         .map(|value| JsString::from(value.as_str()).into())
         .unwrap_or_default())
@@ -341,8 +469,12 @@ mod tests {
 
     use super::*;
 
-    async fn run(source: &str, input: ScriptInput) -> ScriptEffects {
-        ScriptEngine::default().run(source.to_owned(), &input).await
+    fn run(source: &str, input: ScriptInput) -> ScriptEffects {
+        evaluate(
+            source,
+            serde_json::to_string(&input).unwrap(),
+            Limits::default(),
+        )
     }
 
     fn handler_input(body: Value) -> ScriptInput {
@@ -369,8 +501,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn records_ordered_global_changes_and_request_variables() {
+    #[test]
+    fn records_ordered_global_changes_and_request_variables() {
         let input = ScriptInput {
             globals: BTreeMap::from([("old".to_owned(), json!("1"))]),
             environment: BTreeMap::from([("host".to_owned(), "example.test".to_owned())]),
@@ -388,8 +520,7 @@ mod tests {
             client.log(request.variables.get("id"), request.environment.get("host"));
             "#,
             input,
-        )
-        .await;
+        );
         assert_eq!(effects.error, None);
         assert_eq!(
             effects.globals,
@@ -413,8 +544,8 @@ mod tests {
         assert_eq!(messages, vec!["empty: false token: abc", "7 example.test"]);
     }
 
-    #[tokio::test]
-    async fn exposes_the_response_and_runs_queued_tests_after_the_body() {
+    #[test]
+    fn exposes_the_response_and_runs_queued_tests_after_the_body() {
         let effects = run(
             r#"
             client.test("runs after the body", () => client.assert(globalThis.seen === true));
@@ -427,8 +558,7 @@ mod tests {
             globalThis.seen = true;
             "#,
             handler_input(json!({ "name": "users", "items": [{ "id": 1 }, { "id": 2 }] })),
-        )
-        .await;
+        );
         assert_eq!(effects.error, None);
         let tests: Vec<_> = effects
             .tests
@@ -459,8 +589,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn exit_ends_only_the_script_and_keeps_effects() {
+    #[test]
+    fn exit_ends_only_the_script_and_keeps_effects() {
         let effects = run(
             r#"
             client.global.set("before", 1);
@@ -469,8 +599,7 @@ mod tests {
             client.global.set("after", 1);
             "#,
             ScriptInput::default(),
-        )
-        .await;
+        );
         assert_eq!(effects.error, None);
         assert!(effects.exited);
         assert_eq!(
@@ -480,8 +609,8 @@ mod tests {
         assert_eq!(effects.tests.len(), 1);
     }
 
-    #[tokio::test]
-    async fn keeps_effects_before_an_exception() {
+    #[test]
+    fn keeps_effects_before_an_exception() {
         let effects = run(
             r#"
             client.global.set("kept", true);
@@ -489,8 +618,7 @@ mod tests {
             client.assert(false, "boom");
             "#,
             ScriptInput::default(),
-        )
-        .await;
+        );
         assert!(effects.error.as_deref().unwrap().contains("boom"));
         assert_eq!(
             effects.globals,
@@ -498,12 +626,21 @@ mod tests {
         );
         assert_eq!(effects.logs[0].level, "warn");
 
-        let syntax = run("this is not javascript", ScriptInput::default()).await;
+        let syntax = run("this is not javascript", ScriptInput::default());
         assert!(syntax.error.unwrap().contains("SyntaxError"));
     }
 
-    #[tokio::test]
-    async fn provides_crypto_and_random_helpers() {
+    #[test]
+    fn scripts_cannot_read_the_environment() {
+        let effects = run(
+            r#"client.log(String(__zedHttpDynamic("$env.PATH")), String(__zedHttpDynamic("$processEnv PATH")));"#,
+            ScriptInput::default(),
+        );
+        assert_eq!(effects.logs[0].message, "undefined undefined");
+    }
+
+    #[test]
+    fn provides_crypto_and_random_helpers() {
         let effects = run(
             r#"
             client.log(crypto.sha256().updateWithText("ab").updateWithText("c").digest().toHex());
@@ -512,8 +649,7 @@ mod tests {
             client.log($random.uuid.length, typeof $random.integer(1, 5), $random.alphabetic(4).length);
             "#,
             ScriptInput::default(),
-        )
-        .await;
+        );
         assert_eq!(effects.error, None);
         let messages: Vec<_> = effects
             .logs
@@ -531,31 +667,11 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn stops_runaway_scripts() {
-        let looping = run("while (true) {}", ScriptInput::default()).await;
-        assert!(looping.error.unwrap().contains("loop"), "loop limit");
-        let recursing = run("function f() { return f(); } f();", ScriptInput::default()).await;
-        assert!(recursing.error.is_some());
-    }
-
     #[test]
-    fn abandons_scripts_past_the_wall_clock_limit() {
-        // The abandoned thread spins until the process exits, so the runtime must not wait for it.
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_time()
-            .build()
-            .unwrap();
-        let engine = ScriptEngine::new(Limits {
-            wall_clock: Duration::from_millis(100),
-            loop_iterations: u64::MAX,
-            recursion: 256,
-        });
-        let slow = runtime.block_on(engine.run(
-            "let x = 0; for (let i = 0; i < 1e12; i++) { x += i; }".to_owned(),
-            &ScriptInput::default(),
-        ));
-        runtime.shutdown_background();
-        assert!(slow.error.unwrap().contains("time limit"));
+    fn stops_runaway_scripts() {
+        let looping = run("while (true) {}", ScriptInput::default());
+        assert!(looping.error.unwrap().contains("loop"), "loop limit");
+        let recursing = run("function f() { return f(); } f();", ScriptInput::default());
+        assert!(recursing.error.is_some());
     }
 }

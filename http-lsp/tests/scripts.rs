@@ -1,8 +1,13 @@
 #[allow(dead_code)]
 mod common;
 
-use common::{start_server, Workspace};
-use zed_http_lsp::report::OutputView;
+use std::time::{Duration, Instant};
+
+use common::{script_engine, start_server, Workspace};
+use zed_http_lsp::{
+    report::OutputView,
+    script::{Limits, ScriptInput},
+};
 
 #[tokio::test]
 async fn scripts_prepare_requests_and_carry_globals_between_them() {
@@ -102,4 +107,44 @@ GET {{baseUrl}}/json
         .clone()
         .unwrap();
     assert_eq!(echo["token"], "1");
+}
+
+#[tokio::test]
+async fn kills_scripts_past_the_wall_clock_and_keeps_working() {
+    let engine = script_engine(Limits {
+        wall_clock: Duration::from_millis(500),
+        ..Limits::default()
+    });
+    // The loop limit is per call frame, so only killing the worker stops this.
+    let nested = "function f() { for (let j = 0; j < 4e6; j++) {} } \
+                  for (let i = 0; i < 4e6; i++) f();";
+    let input = ScriptInput::default();
+    let started = Instant::now();
+    let (first, second) = tokio::join!(
+        engine.run(nested.to_owned(), &input),
+        engine.run(nested.to_owned(), &input),
+    );
+    for effects in [first, second] {
+        assert!(effects.error.unwrap().contains("time limit"));
+    }
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    // Both worker slots are free again.
+    let effects = engine
+        .run("client.log('still alive')".to_owned(), &input)
+        .await;
+    assert_eq!(effects.error, None);
+    assert_eq!(effects.logs[0].message, "still alive");
+}
+
+#[tokio::test]
+async fn decodes_declared_charsets_for_reports_and_scripts() {
+    let address = start_server().await;
+    let workspace = Workspace::new(address);
+    let runner = workspace.runner();
+    let text = "GET {{baseUrl}}/latin1\n> {% client.test(\"decoded\", () => client.assert(response.body === \"café\")); %}\n";
+    let report = workspace.run(&runner, text, None).await;
+    let output = report.render(OutputView::Full);
+    assert!(output.ends_with("\ncafé\n"), "{output}");
+    assert!(output.contains("# ✓ decoded"), "{output}");
 }

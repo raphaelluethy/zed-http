@@ -7,10 +7,11 @@ use std::{
 };
 
 use reqwest::cookie::Jar;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// One `client.global` mutation, applied in script order.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GlobalChange {
     Set(String, Value),
     Clear(String),
