@@ -1,142 +1,122 @@
 > [!WARNING]
-> **Experimental and a heavy work in progress.** This extension is an exploration of IntelliJ-compatible HTTP request support in Zed. Compatibility, installation behavior, cache formats, and configuration may change without notice. Do not rely on it for production-critical workflows yet.
+> **Experimental and a heavy work in progress.** Compatibility, installation behavior, and cache formats may change. Do not rely on this extension for production-critical workflows yet.
 
 # HTTP extension for Zed
 
-`zed-http` adds language support and runnable HTTP requests to Zed. Its goal is to let a project share JetBrains-style `.http` files between IntelliJ-based IDEs and Zed without maintaining editor-specific request files.
+`zed-http` lets projects share JetBrains-style `.http` files between IntelliJ-based IDEs and Zed. It uses Kulala for both language intelligence and request semantics; this project only supplies the Zed integration. It is not affiliated with JetBrains or the Kulala project.
 
-The extension currently combines the Kulala language server with a pinned Kulala CLI/Core runner. It is not affiliated with JetBrains or the Kulala project.
+## Architecture
+
+Zed runs Kulala LS plus a separate request-execution path:
+
+- **Kulala LS** (`@mistweaverco/kulala-ls@1.11.1`) is the HTTP language server and owns completion and hover.
+- **The execution adapter** (`zed-http-lsp`) owns only Zed code lenses, commands, response buffers, and process supervision. Zed currently exposes these editor actions to extensions through a language-server slot, so the adapter speaks the narrow LSP subset required for those actions. It provides no HTTP language intelligence and does not parse or execute requests.
+
+For every index or execution operation, the adapter starts the bundled **Kulala Core 0.36.0** sidecar, sends one JSON request, reads one JSON response, and lets the process exit.
+
+```diagram
+┌─────┐     ┌───────────┐
+│ Zed │────▶│ Kulala LS │  completion and hover
+└──┬──┘     └───────────┘
+   │
+   ▼
+┌───────────────────┐     ┌─────────────┐
+│ Execution adapter │────▶│ Kulala Core │  parse, run, scripts, state
+│ (editor bridge)   │     │ sidecar     │
+└───────────────────┘     └─────────────┘
+```
+
+There is no custom Rust HTTP parser, client, JavaScript engine, cookie jar, or standalone `zed-http-runner` CLI. Keeping Kulala Core as the single execution boundary avoids the syntax drift that occurred when those features were reimplemented locally.
 
 ## Features
 
-- Syntax highlighting for HTTP methods, headers, URLs, variables, and request bodies
-- Completions for methods, URL schemes, HTTP versions, headers, and variables
-- Environment-variable completion from `http-client.env.json`, `http-client.private.env.json`, and `.env`
-- Runnable markers for individual requests
-- A task for running every request in the current file
-- JetBrains-style pre-request and response-handler scripts
-- Persistent `client.global` variables and cookies across separate request runs
-- Automatic environment selection without prompting on every request
+- Syntax highlighting, completion, and hover for HTTP files
+- **▶ Send** and **▶ Send All** code lenses using the current in-memory document, including unsaved edits
+- Response buffers with full, headers-only, reopen, and save actions
+- Kulala Core support for IntelliJ-style variables and environments, external bodies, multipart requests, pre-request and response scripts, request chaining, GraphQL, WebSocket, gRPC, imports, and response redirection
+- Persistent `client.global` values and cookies using Kulala Core's state store
 
-## Trying a development checkout
+Kulala Core is the compatibility boundary. The adapter passes the complete source document to Core and does not filter syntax. This provides substantially broader IntelliJ HTTP compatibility than the removed local parser, but it does not imply exact JetBrains IDE parity. In particular, compatibility depends on the pinned Core release; custom methods, executable HTTP/3, and some IDE-specific behaviors remain upstream gaps.
 
-This experimental version should be installed as a Zed development extension:
+## Installation and use
 
-1. Open Zed's command palette.
-2. Run **zed: install dev extension**.
-3. Select this repository's directory.
-4. Reload the extension or restart Zed after changing the generated language tasks.
+Install a development checkout with **zed: install dev extension** and select this repository. When an HTTP file is first opened, Zed installs the pinned Kulala LS package and downloads this project's platform archive. That archive contains both the execution adapter and Kulala Core. If the archive cannot be downloaded, for example while offline, the extension reuses a previously downloaded adapter; without one, only request execution is unavailable and completion and hover keep working.
 
-The language server is downloaded into Zed's extension-managed storage. Running requests additionally requires Node.js 20+ and `npm` on your `PATH`.
+Use **▶ Send** above one request or **▶ Send All** above the first request. Requests run in the background and show progress in the status bar. After execution, the adapter refreshes the code lenses and caches the response for **Show**, **Headers**, and **Save**. Click **Show** or **Headers** to open it; Zed does not currently let a generic extension language-server process force-open a response tab.
 
-## Running requests
+Nothing is installed into the project or as a global package. Request execution does not require Node.js, npm, or a task shell on `PATH`; Kulala LS runs with Zed's managed Node.js runtime.
 
-Place the cursor in a request and use its runnable marker to invoke **Run HTTP request at cursor**. The selected request is determined from Zed's current row. To execute the complete file, choose **Run all HTTP requests in file** from Zed's task picker.
+## Environments and state
 
-The first request run:
+Kulala Core discovers standard `http-client.env.json` and `http-client.private.env.json` files. The adapter selects:
 
-1. Installs the pinned `@mistweaverco/kulala-cli@0.16.0` package without lifecycle scripts.
-2. Downloads the matching Kulala Core `0.36.0` executable.
-3. Verifies the executable against a pinned SHA-256 digest.
-4. Reuses and re-verifies the cached installation on later runs.
+1. `ZED_HTTP_ENV`, when configured;
+2. `default`, when present;
+3. otherwise the alphabetically first environment. `$shared` holds variables shared by all environments and is never selected.
 
-Nothing is installed into the project or as a global npm package. The runner cache is stored under `${XDG_CACHE_HOME:-$HOME/.cache}/zed-http/kulala-cli-0.16.0` on macOS and Linux, or the equivalent local application-data directory on Windows.
+Keep secrets in `http-client.private.env.json` and exclude it from version control.
 
-## Environments
+Kulala Core persists globals and cookies in its OS application-data `kulala.db`. Core 0.36.0 does not expose a portable per-workspace storage override, so this state is shared between projects for the same OS user. Use distinct global names where cross-project collisions matter and clear sensitive Core state when it is no longer needed.
 
-The runner looks from the request file's directory towards the filesystem root for the nearest directory containing either of these standard JetBrains files:
+## Security model
 
-- `http-client.env.json`
-- `http-client.private.env.json`
+Only execute `.http` files you trust. IntelliJ-style scripts, environment access, external body files, and external tools are intentionally powerful and run with the user's permissions. The adapter inherits the worktree environment so `$env` syntax remains compatible; request scripts can therefore read those environment variables.
 
-It selects an environment without showing a prompt. The priority is:
+The integration adds the following boundaries:
 
-1. The environment named by `ZED_HTTP_ENV`, when set.
-2. An environment named `default`.
-3. The first environment declared in the environment file.
+- Kulala LS and Core versions are pinned. Every Core platform asset is checked against a committed SHA-256 digest before release packaging.
+- Release CI actions are commit-pinned, write permission is limited to the publish job, and release archives include `SHA256SUMS`.
+- The adapter resolves Core only from explicit `KULALA_CORE_PATH` or beside its own executable; it never auto-runs a `kulala-core` found on `PATH`.
+- Each Core operation has a hard timeout. Input is limited to 16 MiB, stdout to 32 MiB, and diagnostics to 1 MiB. Dropping or cancelling an operation kills its child process.
+- Temporary response files use a process-private directory and mode `0600` on Unix, then are removed when the adapter shuts down. Explicitly saved responses also use mode `0600` on Unix.
 
-The files themselves remain unchanged. Environment selection supplies configuration such as `baseUrl`, credentials, and seeded IDs; it does not determine which authenticated session remains active after a login response handler runs.
+Response buffers and saved files can contain authorization headers, cookies, tokens, and private response data. Review them before sharing.
 
-For example:
+The extension capability manifest restricts downloads to this project's GitHub releases and npm installation to `@mistweaverco/kulala-ls`.
+
+## Supported platforms
+
+Release bundles are built for:
+
+- macOS arm64 and x86-64
+- Linux arm64 and x86-64
+- Windows x86-64
+
+Kulala Core 0.36.0 does not publish a Windows arm64 executable, so that platform is intentionally rejected instead of publishing a nonfunctional adapter.
+
+## Development
+
+Fetch and verify the pinned Core binary, then build the adapter:
+
+```bash
+node scripts/fetch_kulala_core.cjs
+cargo build --package zed-http-lsp
+```
+
+For a local Zed build, configure both executables explicitly:
 
 ```json
 {
-  "default": {
-    "baseUrl": "http://localhost:3000",
-    "email": "admin@example.test",
-    "password": "dev-password"
-  },
-  "member": {
-    "baseUrl": "http://localhost:3000",
-    "email": "member@example.test",
-    "password": "dev-password"
+  "lsp": {
+    "zed-http-lsp": {
+      "binary": {
+        "path": "/absolute/path/to/zed-http/target/debug/zed-http-lsp",
+        "env": {
+          "KULALA_CORE_PATH": "/absolute/path/to/zed-http/target/kulala-core/kulala-core"
+        }
+      }
+    }
   }
 }
 ```
 
-Keep secrets in `http-client.private.env.json` and exclude that file from version control.
-
-## Authentication and request chaining
-
-JetBrains-compatible response handlers can store a login token for later requests:
-
-```http
-### Login
-# @name login
-POST {{baseUrl}}/api/auth/sign-in/email
-Content-Type: application/json
-
-{
-  "email": "{{email}}",
-  "password": "{{password}}"
-}
-
-> {%
-    client.global.set("authToken", response.body.token);
-%}
-
-### Get session
-GET {{baseUrl}}/api/auth/get-session
-Authorization: Bearer {{authToken}}
-```
-
-Run **Login** once and later request runs can resolve `{{authToken}}`. If the file contains separate requests such as **Login as admin** and **Login as member**, running either request replaces the same persisted `authToken`; subsequent requests therefore use the most recently authenticated user.
-
-Kulala Core persists `client.global` values and cookies in its OS-specific application-data directory, so they survive the separate processes created by Zed tasks.
-
-## Language server
-
-The extension downloads `@mistweaverco/kulala-ls` into Zed's extension-managed storage and starts it with Zed's managed Node.js runtime. No project dependency or global installation is required for language features.
-
-The language server currently provides completion and hover capabilities. Request execution is implemented separately because the language server does not expose an LSP command for running requests.
-
-## Requirements and limitations
-
-- Request execution currently requires a POSIX `/bin/sh` task shell.
-- Node.js 20+ and `npm` must be available on `PATH`.
-- The first request requires network access to the npm registry and GitHub Releases.
-- Kulala Core publishes macOS arm64/x86-64, Linux arm64/x86-64, and Windows x86-64 binaries, but the current POSIX task wrapper does not yet provide native Windows task support.
-- Kulala aims for JetBrains HTTP Client compatibility, but full IntelliJ feature parity is not guaranteed. Unsupported syntax and behavioral differences should be treated as bugs in this experiment.
-
-Kulala's current macOS release binaries have an [upstream ad-hoc signing issue](https://github.com/mistweaverco/kulala-core/issues/178). After verifying the upstream digest, the bootstrap repairs the cached copy with `/usr/bin/codesign` and verifies the repaired signature. This workaround should be removed once upstream releases pass their signing gate.
-
-## Security
-
-`.http` pre-request and response-handler scripts execute as trusted code. Only run request files you trust. Request output may contain authorization headers, cookies, tokens, or response data; review terminal output before sharing it.
-
-The bootstrap installs the CLI with npm lifecycle scripts disabled and verifies the separately downloaded Core executable against platform-specific pinned checksums.
-
-## Development
-
-Zed currently does not expose extension-managed executable paths to language task templates, so the generated task embeds the installer/launcher. The readable source is [`scripts/kulala_runner_bootstrap.cjs`](scripts/kulala_runner_bootstrap.cjs); do not edit the encoded payload in `languages/http/tasks.json` directly.
-
-Regenerate and verify the task artifact with:
+Verify the workspace with:
 
 ```bash
-node scripts/generate_http_tasks.mjs --write
-node scripts/generate_http_tasks.mjs --check
-node --test scripts/kulala_runner_bootstrap.test.cjs
-node scripts/smoke_kulala_runner.cjs
-cargo fmt --check
-cargo test
+cargo fmt --all --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace --all-targets
+cargo build --locked --target wasm32-wasip2
+cargo build --locked --package zed-http-lsp
+node scripts/smoke_lsp.cjs
 ```

@@ -1,10 +1,10 @@
 id = "http"
 name = "HTTP"
-description = "Syntax highlighting and language-server support for .http files"
-version = "0.0.2"
+description = "HTTP file support with Kulala Core request execution"
+version = "0.0.3"
 schema_version = 1
 authors = ["raphael@lty.gg"]
-repository = "https://github.com/tie304/zed-http"
+repository = "https://github.com/raphaelluethy/zed-http"
 
 [grammars.http]
 repository = "https://github.com/rest-nvim/tree-sitter-http"
@@ -13,3 +13,16 @@ rev = "e061995f0caf2fa30f68fa1fdf2c08bcbd4629a8"
 [language_servers.kulala-ls]
 name = "Kulala HTTP Language Server"
 languages = ["http"]
+
+[language_servers.zed-http-lsp]
+name = "HTTP Request Execution Adapter"
+languages = ["http"]
+
+[[capabilities]]
+kind = "download_file"
+host = "github.com"
+path = ["raphaelluethy", "zed-http", "**"]
+
+[[capabilities]]
+kind = "npm:install"
+package = "@mistweaverco/kulala-ls"
