@@ -200,18 +200,64 @@ struct OpenScript {
     lexer: JsLexer,
 }
 
-/// Just enough JavaScript lexing to find the closing `%}` outside strings, template literals
-/// and comments. Regular expression literals are not recognised.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum JsLexer {
-    #[default]
+/// Just enough JavaScript lexing to find the closing `%}` outside strings, template literals,
+/// regular expression literals and comments. Template substitutions (`${…}`) are treated as
+/// part of the template.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JsLexer {
+    mode: JsMode,
+    /// Whether a `/` here starts a regular expression rather than a division, judged from the
+    /// previous significant token.
+    regex_allowed: bool,
+    /// The identifier or keyword being read.
+    word: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JsMode {
     Code,
     Quoted(u8),
     Template,
     BlockComment,
+    Regex { class: bool },
 }
 
+impl Default for JsLexer {
+    fn default() -> Self {
+        Self {
+            mode: JsMode::Code,
+            regex_allowed: true,
+            word: String::new(),
+        }
+    }
+}
+
+/// Keywords after which a `/` starts a regular expression.
+const REGEX_KEYWORDS: &[&str] = &[
+    "return",
+    "typeof",
+    "instanceof",
+    "in",
+    "of",
+    "new",
+    "delete",
+    "void",
+    "throw",
+    "case",
+    "do",
+    "else",
+    "yield",
+    "await",
+];
+
 impl JsLexer {
+    fn end_word(&mut self) {
+        if !self.word.is_empty() {
+            self.regex_allowed = REGEX_KEYWORDS.contains(&self.word.as_str());
+            self.word.clear();
+        }
+    }
+
     /// Returns the offset of a closing `%}` in code, carrying the state over to the next line.
     fn find_close(&mut self, line: &str) -> Option<usize> {
         let bytes = line.as_bytes();
@@ -219,44 +265,71 @@ impl JsLexer {
         while index < bytes.len() {
             let byte = bytes[index];
             let next = bytes.get(index + 1).copied();
-            match *self {
-                JsLexer::Code => match (byte, next) {
-                    (b'%', Some(b'}')) => return Some(index),
-                    (b'\'' | b'"', _) => *self = JsLexer::Quoted(byte),
-                    (b'`', _) => *self = JsLexer::Template,
-                    (b'/', Some(b'/')) => break,
-                    (b'/', Some(b'*')) => {
-                        *self = JsLexer::BlockComment;
+            match self.mode {
+                JsMode::Code => {
+                    if byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$' || byte >= 0x80
+                    {
+                        self.word.push(byte as char);
                         index += 1;
+                        continue;
                     }
-                    _ => {}
-                },
-                JsLexer::Quoted(quote) => {
+                    self.end_word();
+                    match (byte, next) {
+                        (b'%', Some(b'}')) => return Some(index),
+                        (b'\'' | b'"', _) => self.mode = JsMode::Quoted(byte),
+                        (b'`', _) => self.mode = JsMode::Template,
+                        (b'/', Some(b'/')) => break,
+                        (b'/', Some(b'*')) => {
+                            self.mode = JsMode::BlockComment;
+                            index += 1;
+                        }
+                        (b'/', _) if self.regex_allowed => {
+                            self.mode = JsMode::Regex { class: false }
+                        }
+                        (b')' | b']' | b'}', _) => self.regex_allowed = false,
+                        (byte, _) if byte.is_ascii_whitespace() => {}
+                        _ => self.regex_allowed = true,
+                    }
+                }
+                JsMode::Quoted(quote) => {
                     if byte == b'\\' {
                         index += 1;
                     } else if byte == quote {
-                        *self = JsLexer::Code;
+                        self.mode = JsMode::Code;
+                        self.regex_allowed = false;
                     }
                 }
-                JsLexer::Template => {
+                JsMode::Template => {
                     if byte == b'\\' {
                         index += 1;
                     } else if byte == b'`' {
-                        *self = JsLexer::Code;
+                        self.mode = JsMode::Code;
+                        self.regex_allowed = false;
                     }
                 }
-                JsLexer::BlockComment => {
+                JsMode::BlockComment => {
                     if byte == b'*' && next == Some(b'/') {
-                        *self = JsLexer::Code;
+                        self.mode = JsMode::Code;
                         index += 1;
                     }
                 }
+                JsMode::Regex { class } => match byte {
+                    b'\\' => index += 1,
+                    b'[' => self.mode = JsMode::Regex { class: true },
+                    b']' => self.mode = JsMode::Regex { class: false },
+                    b'/' if !class => {
+                        self.mode = JsMode::Code;
+                        self.regex_allowed = false;
+                    }
+                    _ => {}
+                },
             }
             index += 1;
         }
-        // Quoted strings cannot span lines.
-        if matches!(self, JsLexer::Quoted(_)) {
-            *self = JsLexer::Code;
+        self.end_word();
+        // Strings and regular expressions cannot span lines.
+        if matches!(self.mode, JsMode::Quoted(_) | JsMode::Regex { .. }) {
+            self.mode = JsMode::Code;
         }
         None
     }
@@ -969,6 +1042,30 @@ mod tests {
                 overwrite: false
             })
         );
+    }
+
+    #[test]
+    fn ignores_script_delimiters_in_regular_expressions() {
+        let script = |source: &str| {
+            let document = parse(&format!("GET http://x\n> {{% {source} %}}\n"));
+            match &document.blocks[0].handlers[..] {
+                [Script::Inline { source, .. }] => source.clone(),
+                handlers => panic!("expected one handler, got {handlers:?}"),
+            }
+        };
+        let source = "const re = /%}/; client.log('OK');";
+        assert_eq!(script(source), source);
+        let source = "const re = /[/%}]+/g; client.log(re);";
+        assert_eq!(script(source), source);
+        let source = "if (x) return /%}/.test(y);";
+        assert_eq!(script(source), source);
+        // Division is not a regular expression.
+        assert_eq!(
+            script("const half = a / 2; const b = (c) / 4"),
+            "const half = a / 2; const b = (c) / 4"
+        );
+        let source = "const ratio = total / count;";
+        assert_eq!(script(&format!("{source} %}} trailing")), source);
     }
 
     #[test]

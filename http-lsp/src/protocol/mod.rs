@@ -93,14 +93,10 @@ pub struct Context<'a> {
 pub async fn send(request: &PreparedRequest, context: &Context<'_>) -> Result<Response, String> {
     match Protocol::of(&request.method) {
         Protocol::Http => http::send(request, context).await,
-        Protocol::GraphQl => Err(unsupported("GraphQL")),
+        Protocol::GraphQl => http::send(&graphql::into_http(request.clone())?, context).await,
         Protocol::WebSocket => websocket::send(request, context).await,
         Protocol::Grpc => grpc::send(request, context).await,
     }
-}
-
-fn unsupported(protocol: &str) -> String {
-    format!("{protocol} requests are not yet supported")
 }
 
 /// Every TLS client uses rustls with the ring provider, installed once per process.

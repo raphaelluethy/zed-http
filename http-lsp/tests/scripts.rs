@@ -148,3 +148,65 @@ async fn decodes_declared_charsets_for_reports_and_scripts() {
     assert!(output.ends_with("\ncafé\n"), "{output}");
     assert!(output.contains("# ✓ decoded"), "{output}");
 }
+
+#[tokio::test]
+async fn bounds_script_results() {
+    // Building 24 MiB of strings is slow in debug builds; this test is about size, not time.
+    let engine = script_engine(Limits {
+        wall_clock: Duration::from_secs(120),
+        ..Limits::default()
+    });
+    let input = ScriptInput::default();
+
+    let thrown = engine
+        .run(
+            "let s = 'x'; for (let i = 0; i < 18; i++) s += s; throw new Error(s);".to_owned(),
+            &input,
+        )
+        .await;
+    let error = thrown.error.unwrap();
+    assert!(error.len() < 100 * 1024, "{}", error.len());
+    assert!(
+        error.ends_with("[truncated]"),
+        "{}",
+        &error[..200.min(error.len())]
+    );
+
+    let huge = engine
+        .run(
+            "let s = 'x'; for (let i = 0; i < 23; i++) s += s; \
+             client.global.set('a', s); client.global.set('b', s); client.global.set('c', s);"
+                .to_owned(),
+            &input,
+        )
+        .await;
+    assert!(huge.error.unwrap().contains("larger than 16 MiB"));
+    assert!(huge.globals.is_empty());
+}
+
+/// A worker that floods stdout is killed as soon as it passes the limit instead of blocking
+/// until the wall clock runs out.
+#[cfg(unix)]
+#[tokio::test]
+async fn kills_workers_that_flood_stdout() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = std::env::temp_dir().join(format!("zed-http-flood-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let worker = directory.join("flood");
+    std::fs::write(&worker, "#!/bin/sh\nexec yes\n").unwrap();
+    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let engine = zed_http_lsp::script::ScriptEngine::new(
+        Limits {
+            wall_clock: Duration::from_secs(30),
+            ..Limits::default()
+        },
+        worker,
+    );
+    let started = Instant::now();
+    let effects = engine.run(String::new(), &ScriptInput::default()).await;
+    let error = effects.error.unwrap();
+    assert!(error.contains("larger than 16 MiB"), "{error}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    std::fs::remove_dir_all(directory).unwrap();
+}

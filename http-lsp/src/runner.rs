@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::{
     body,
-    protocol::{self, graphql, http::Clients, Context, PreparedRequest, Protocol, Response},
+    protocol::{self, http::Clients, Context, PreparedRequest, Response},
     report::{Body, ExecutedRequest, Execution, Report, ScriptConsoleEntry, Timings},
     script::{
         ScriptEffects, ScriptEngine, ScriptInput, ScriptRequest, ScriptResponse, MAX_SOURCE_BYTES,
@@ -158,7 +158,7 @@ impl Runner {
                         let execution = self.execute_in(frame, block, overrides, state).await;
                         state.report.executions.push(execution);
                     }
-                    Step::Run(command) => self.run_command(frame, command, state).await,
+                    Step::Run(command) => self.run_command(frame, command, overrides, state).await,
                 }
             }
         })
@@ -184,8 +184,17 @@ impl Runner {
 
     /// `run #Name` executes a named request from this file or its imports; `run ./file.http`
     /// executes every request in another file. `(@name=value)` overrides file variables.
-    async fn run_command(&self, frame: &FileFrame, command: &RunCommand, state: &mut RunState) {
-        let overrides: BTreeMap<String, String> = command.overrides.iter().cloned().collect();
+    async fn run_command(
+        &self,
+        frame: &FileFrame,
+        command: &RunCommand,
+        inherited: &BTreeMap<String, String>,
+        state: &mut RunState,
+    ) {
+        // Overrides from enclosing `run` commands apply too; this command's own win. Each
+        // command gets its own copy, so nothing leaks into sibling commands.
+        let mut overrides = inherited.clone();
+        overrides.extend(command.overrides.iter().cloned());
         let failure = match &command.target {
             RunTarget::Request(name) => {
                 if let Some(block) = find_named(&frame.document, name) {
@@ -271,7 +280,7 @@ impl Runner {
         }
 
         let mut unresolved = Vec::new();
-        let request = prepare(block, &variables, context.base_dir, &mut unresolved);
+        let request = prepare(block, &variables, context.base_dir, &mut unresolved).await;
         execution.warnings = unresolved
             .iter()
             .map(|name| format!("unresolved variable {{{{{name}}}}}"))
@@ -561,7 +570,7 @@ fn normalize(path: &Path) -> PathBuf {
 }
 
 /// Substitutes variables and resolves the body. Unresolved names are collected, not fatal.
-fn prepare(
+async fn prepare(
     block: &RequestBlock,
     variables: &Variables,
     base_dir: &Path,
@@ -581,30 +590,40 @@ fn prepare(
         result.text
     };
     let url = substitute(&block.url);
+    // A multipart boundary is resolved once so the header and the delimiters agree.
+    let boundary = match &block.body {
+        syntax::Body::Multipart { boundary, .. } => Some((boundary.clone(), substitute(boundary))),
+        syntax::Body::Parts(_) => None,
+    };
     let headers = block
         .headers
         .iter()
-        .map(|header| Header {
-            name: substitute(&header.name),
-            value: substitute(&header.value),
+        .map(|header| {
+            let value = match &boundary {
+                Some((raw, resolved)) if header.name.eq_ignore_ascii_case("content-type") => {
+                    substitute(&header.value.replacen(raw.as_str(), resolved, 1))
+                }
+                _ => substitute(&header.value),
+            };
+            Header {
+                name: substitute(&header.name),
+                value,
+            }
         })
         .collect();
-    let body = body::prepare(&block.body, base_dir, &mut substitute)?;
+    let resolved_boundary = boundary.as_ref().map(|(_, resolved)| resolved.as_str());
+    let body = body::prepare(&block.body, resolved_boundary, base_dir, &mut substitute).await?;
     if let Some(error) = failure {
         return Err(error);
     }
-    let request = PreparedRequest {
+    Ok(PreparedRequest {
         method: block.method.clone(),
         url,
         http_version: block.http_version.clone(),
         headers,
         body,
         directives: block.directives.clone(),
-    };
-    if Protocol::of(&block.method) == Protocol::GraphQl {
-        return graphql::into_http(request);
-    }
-    Ok(request)
+    })
 }
 
 /// Copies a protocol response into the report and returns the body as scripts and named
@@ -741,8 +760,37 @@ mod tests {
         assert!(!is_json("text/json-ish"));
     }
 
-    #[test]
-    fn prepares_requests_with_substitution() {
+    #[tokio::test]
+    async fn resolves_a_dynamic_multipart_boundary_once() {
+        let document = syntax::parse(
+            "POST http://x\nContent-Type: multipart/form-data; boundary={{$uuid}}\n\n\
+             --{{$uuid}}\nContent-Disposition: form-data; name=\"a\"\n\n1\n--{{$uuid}}--\n",
+        );
+        let request = prepare(
+            &document.blocks[0],
+            &Variables::default(),
+            Path::new("."),
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap();
+        let boundary = request.headers[0]
+            .value
+            .split_once("boundary=")
+            .unwrap()
+            .1
+            .to_owned();
+        assert_eq!(boundary.len(), 36);
+        let PreparedBody::Bytes(body) = request.body else {
+            panic!("expected a body");
+        };
+        let body = String::from_utf8(body).unwrap();
+        assert!(body.starts_with(&format!("--{boundary}\r\n")), "{body}");
+        assert!(body.ends_with(&format!("--{boundary}--\r\n")), "{body}");
+    }
+
+    #[tokio::test]
+    async fn prepares_requests_with_substitution() {
         let document =
             syntax::parse("POST {{host}}/items\nX-Token: {{token}}\n\n{\"id\": \"{{id}}\"}\n");
         let variables = Variables {
@@ -759,6 +807,7 @@ mod tests {
             Path::new("."),
             &mut unresolved,
         )
+        .await
         .unwrap();
         assert_eq!(request.url, "http://example.test/items");
         assert_eq!(request.headers[0].value, "{{token}}");

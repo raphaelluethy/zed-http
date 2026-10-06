@@ -217,3 +217,33 @@ async fn runs_other_files_and_stops_run_cycles() {
     );
     assert_eq!(report.executions.len(), 2, "{rendered}");
 }
+
+#[tokio::test]
+async fn scopes_run_overrides_to_nested_commands() {
+    let address = start_server().await;
+    let workspace = Workspace::new(address);
+    workspace.write(
+        "child.http",
+        "### Req\nGET {{baseUrl}}/json?token={{token}}\n\n###\nrun #Req\n\n###\nrun #Req (@token=inner)\n\n###\nrun #Req\n",
+    );
+    let runner = workspace.runner();
+    let report = workspace
+        .run(
+            &runner,
+            "run ./child.http (@token=outer)\n\n###\nGET {{baseUrl}}/json?token={{token}}\n",
+            None,
+        )
+        .await;
+    let tokens: Vec<_> = report
+        .executions
+        .iter()
+        .map(|execution| {
+            let url = &execution.request.as_ref().unwrap().url;
+            url.rsplit_once("token=").unwrap().1.to_owned()
+        })
+        .collect();
+    assert_eq!(
+        tokens,
+        vec!["outer", "outer", "inner", "outer", "env-token"]
+    );
+}

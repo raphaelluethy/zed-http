@@ -6,22 +6,36 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use tokio::io::AsyncReadExt;
+
 use crate::{
     protocol::{PreparedBody, MAX_BODY_BYTES},
     syntax::{Body, BodyPart, MultipartPart},
 };
 
-/// Builds the request body. `substitute` replaces `{{ }}` variables in text.
-pub fn prepare(
+/// Replaces `{{ }}` variables in text.
+pub type Substitute<'a> = dyn FnMut(&str) -> String + Send + 'a;
+
+/// Builds the request body. For multipart bodies, `boundary` is the boundary already resolved
+/// for the `Content-Type` header, so a dynamic boundary such as `{{$uuid}}` matches it.
+pub async fn prepare(
     body: &Body,
+    boundary: Option<&str>,
     base_dir: &Path,
-    substitute: &mut dyn FnMut(&str) -> String,
+    substitute: &mut Substitute<'_>,
 ) -> Result<PreparedBody, String> {
     let bytes = match body {
         Body::Parts(parts) if parts.is_empty() => return Ok(PreparedBody::Empty),
-        Body::Parts(parts) => join_parts(parts, base_dir, substitute)?,
-        Body::Multipart { boundary, parts } => {
-            multipart(&substitute(boundary), parts, base_dir, substitute)?
+        Body::Parts(parts) => join_parts(parts, base_dir, substitute).await?,
+        Body::Multipart {
+            boundary: raw,
+            parts,
+        } => {
+            let boundary = match boundary {
+                Some(boundary) => boundary.to_owned(),
+                None => substitute(raw),
+            };
+            multipart(&boundary, parts, base_dir, substitute).await?
         }
     };
     if bytes.len() > MAX_BODY_BYTES {
@@ -34,10 +48,10 @@ pub fn prepare(
 }
 
 /// Parts are separated by newlines, as they were in the source file.
-fn join_parts(
+async fn join_parts(
     parts: &[BodyPart],
     base_dir: &Path,
-    substitute: &mut dyn FnMut(&str) -> String,
+    substitute: &mut Substitute<'_>,
 ) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     for (index, part) in parts.iter().enumerate() {
@@ -50,13 +64,13 @@ fn join_parts(
                 path,
                 substitute: false,
             } => {
-                bytes.extend_from_slice(&read_include(base_dir, &substitute(path))?);
+                bytes.extend_from_slice(&read_include(base_dir, &substitute(path)).await?);
             }
             BodyPart::File {
                 path,
                 substitute: true,
             } => {
-                let contents = read_include(base_dir, &substitute(path))?;
+                let contents = read_include(base_dir, &substitute(path)).await?;
                 let text = String::from_utf8(contents)
                     .map_err(|_| format!("{path} is not UTF-8 text, so it cannot use <@"))?;
                 bytes.extend_from_slice(substitute(&text).as_bytes());
@@ -69,11 +83,11 @@ fn join_parts(
     Ok(bytes)
 }
 
-fn multipart(
+async fn multipart(
     boundary: &str,
     parts: &[MultipartPart],
     base_dir: &Path,
-    substitute: &mut dyn FnMut(&str) -> String,
+    substitute: &mut Substitute<'_>,
 ) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     for part in parts {
@@ -87,7 +101,7 @@ fn multipart(
             bytes.extend_from_slice(line.as_bytes());
         }
         bytes.extend_from_slice(b"\r\n");
-        bytes.extend_from_slice(&join_parts(&part.body, base_dir, substitute)?);
+        bytes.extend_from_slice(&join_parts(&part.body, base_dir, substitute).await?);
         bytes.extend_from_slice(b"\r\n");
         if bytes.len() > MAX_BODY_BYTES {
             return Ok(bytes);
@@ -97,19 +111,35 @@ fn multipart(
     Ok(bytes)
 }
 
-fn read_include(base_dir: &Path, path: &str) -> Result<Vec<u8>, String> {
+/// Reads a regular file of at most [`MAX_BODY_BYTES`]. Devices and FIFOs are rejected before
+/// opening, and the read itself is bounded in case the file grows.
+async fn read_include(base_dir: &Path, path: &str) -> Result<Vec<u8>, String> {
     let path = base_dir.join(path);
-    let size = fs::metadata(&path)
-        .map_err(|error| format!("failed to read {}: {error}", path.display()))?
-        .len();
-    if size > MAX_BODY_BYTES as u64 {
-        return Err(format!(
+    let failed = |error: io::Error| format!("failed to read {}: {error}", path.display());
+    let too_large = || {
+        format!(
             "{} is larger than the {} MiB body limit",
             path.display(),
             MAX_BODY_BYTES / 1024 / 1024
-        ));
+        )
+    };
+    let metadata = tokio::fs::metadata(&path).await.map_err(failed)?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
     }
-    fs::read(&path).map_err(|error| format!("failed to read {}: {error}", path.display()))
+    if metadata.len() > MAX_BODY_BYTES as u64 {
+        return Err(too_large());
+    }
+    let file = tokio::fs::File::open(&path).await.map_err(failed)?;
+    let mut contents = Vec::new();
+    file.take(MAX_BODY_BYTES as u64 + 1)
+        .read_to_end(&mut contents)
+        .await
+        .map_err(failed)?;
+    if contents.len() > MAX_BODY_BYTES {
+        return Err(too_large());
+    }
+    Ok(contents)
 }
 
 /// Writes a response body for `>>` (a fresh `name-N.ext` when the file exists) or `>>!`
@@ -192,27 +222,43 @@ mod tests {
         text.replace("{{name}}", "World")
     }
 
-    #[test]
-    fn joins_text_and_file_includes() {
+    #[tokio::test]
+    async fn joins_text_and_file_includes() {
         let directory = temporary_directory();
         fs::write(directory.join("raw.txt"), "raw {{name}}").unwrap();
         fs::write(directory.join("template.txt"), "hello {{name}}").unwrap();
         let document =
             syntax::parse("POST http://x\n\nstart {{name}}\n< ./raw.txt\n<@ ./template.txt\n");
-        let body = prepare(&document.blocks[0].body, &directory, &mut upper).unwrap();
+        let body = prepare(&document.blocks[0].body, None, &directory, &mut upper)
+            .await
+            .unwrap();
         assert_eq!(
             body,
             PreparedBody::Bytes(b"start World\nraw {{name}}\nhello World".to_vec())
         );
 
         let missing = syntax::parse("POST http://x\n\n< ./missing.txt\n");
-        let error = prepare(&missing.blocks[0].body, &directory, &mut upper).unwrap_err();
+        let error = prepare(&missing.blocks[0].body, None, &directory, &mut upper)
+            .await
+            .unwrap_err();
         assert!(error.contains("missing.txt"), "{error}");
         fs::remove_dir_all(directory).unwrap();
     }
 
-    #[test]
-    fn builds_multipart_bodies() {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_devices_and_directories() {
+        for path in ["/dev/zero", "/tmp"] {
+            let document = syntax::parse(&format!("POST http://x\n\n< {path}\n"));
+            let error = prepare(&document.blocks[0].body, None, Path::new("/"), &mut upper)
+                .await
+                .unwrap_err();
+            assert!(error.contains("not a regular file"), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn builds_multipart_bodies() {
         let directory = temporary_directory();
         fs::write(directory.join("upload.txt"), "file contents").unwrap();
         let document = syntax::parse(
@@ -222,7 +268,9 @@ mod tests {
              < ./upload.txt\n--B--\n",
         );
         let PreparedBody::Bytes(body) =
-            prepare(&document.blocks[0].body, &directory, &mut upper).unwrap()
+            prepare(&document.blocks[0].body, None, &directory, &mut upper)
+                .await
+                .unwrap()
         else {
             panic!("expected a body");
         };

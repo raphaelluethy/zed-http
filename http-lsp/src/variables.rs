@@ -170,13 +170,18 @@ impl Expansion {
 
 impl Variables {
     pub fn lookup(&self, name: &str) -> Option<String> {
+        self.template(name)
+            .or_else(|| self.response_reference(name))
+    }
+
+    /// Values from the variable layers, which may themselves contain `{{ }}` references.
+    fn template(&self, name: &str) -> Option<String> {
         self.request
             .get(name)
             .cloned()
             .or_else(|| self.globals.get(name).map(value_text))
             .or_else(|| self.file.get(name).cloned())
             .or_else(|| self.environment.get(name).cloned())
-            .or_else(|| self.response_reference(name))
     }
 
     /// `name.response.body.<JSONPath>` (`$` or `*` for the whole body) and
@@ -265,14 +270,16 @@ impl Variables {
             {
                 None
             } else {
-                match self.lookup(name) {
+                match self.template(name) {
                     Some(value) => {
                         expansion.stack.push(name.to_owned());
                         let value = self.expand(&value, expansion);
                         expansion.stack.pop();
                         Some(value?)
                     }
-                    None => None,
+                    // Response data is server-controlled, so it is never expanded further:
+                    // a body containing `{{$env.SECRET}}` must not read the environment.
+                    None => self.response_reference(name),
                 }
             };
             match value {
@@ -546,6 +553,25 @@ mod tests {
             "Bearer abc header-token [1,2] as text {{login.response.body.$.missing}} \
              {{other.response.body.$}}"
         );
+        // Server-controlled values are literal, even inside other variables.
+        let hostile = Variables {
+            responses: HashMap::from([(
+                "login".to_owned(),
+                response(json!({ "token": "{{$env.PATH}}" })),
+            )]),
+            file: BTreeMap::from([(
+                "auth".to_owned(),
+                "Bearer {{login.response.body.$.token}}".to_owned(),
+            )]),
+            ..Variables::default()
+        };
+        assert_eq!(
+            hostile
+                .substitute("{{auth}} {{login.response.body.$.token}}")
+                .text,
+            "Bearer {{$env.PATH}} {{$env.PATH}}"
+        );
+
         assert_eq!(
             variables.lookup("text.response.body").as_deref(),
             Some("{\"served\": \"as text\"}")

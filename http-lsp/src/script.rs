@@ -42,6 +42,7 @@ const PRELUDE: &str = include_str!("script_prelude.js");
 pub const MAX_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_EFFECTS_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONCURRENT_SCRIPTS: usize = 2;
+const MAX_ERROR_BYTES: usize = 64 * 1024;
 const MAX_WORKER_INPUT_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_WORKER_DIAGNOSTICS: u64 = 64 * 1024;
 /// The first argument that turns the executable into a script worker.
@@ -222,28 +223,44 @@ impl ScriptEngine {
             .take()
             .ok_or("failed to read the worker's stderr")?;
 
-        let write = async move {
+        // Writing and stderr run on their own tasks so a worker that stops reading or floods
+        // stderr cannot stall the stdout read; killing the worker ends both.
+        let write = tokio::spawn(async move {
             // A worker that exits early explains itself through its status and stderr.
             let _ = stdin.write_all(&request).await;
             let _ = stdin.shutdown().await;
-        };
+        });
+        let diagnostics = tokio::spawn(async move {
+            let mut diagnostics = Vec::new();
+            let mut stderr = stderr;
+            let _ = (&mut stderr)
+                .take(MAX_WORKER_DIAGNOSTICS)
+                .read_to_end(&mut diagnostics)
+                .await;
+            let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
+            diagnostics
+        });
         let mut output = Vec::new();
-        let mut diagnostics = Vec::new();
-        let mut stdout = stdout.take(MAX_EFFECTS_BYTES as u64 + 1);
-        let mut stderr = stderr.take(MAX_WORKER_DIAGNOSTICS);
-        let read_output = stdout.read_to_end(&mut output);
-        let read_diagnostics = stderr.read_to_end(&mut diagnostics);
-        let (_, read_output, read_diagnostics) = tokio::join!(write, read_output, read_diagnostics);
-        read_output.map_err(|error| format!("failed to read script results: {error}"))?;
-        let _ = read_diagnostics;
+        let read = stdout
+            .take(MAX_EFFECTS_BYTES as u64 + 1)
+            .read_to_end(&mut output)
+            .await;
+        if read.is_err() || output.len() > MAX_EFFECTS_BYTES {
+            let _ = child.kill().await;
+            write.abort();
+            diagnostics.abort();
+            return Err(match read {
+                Err(error) => format!("failed to read script results: {error}"),
+                Ok(_) => "script results are larger than 16 MiB".to_owned(),
+            });
+        }
         let status = child
             .wait()
             .await
             .map_err(|error| format!("failed to wait for the script worker: {error}"))?;
+        let _ = write.await;
+        let diagnostics = diagnostics.await.unwrap_or_default();
 
-        if output.len() > MAX_EFFECTS_BYTES {
-            return Err("script results are larger than 16 MiB".to_owned());
-        }
         if !status.success() {
             let diagnostics = String::from_utf8_lossy(&diagnostics);
             let diagnostics = diagnostics.trim();
@@ -277,10 +294,15 @@ pub fn worker_main() -> i32 {
         }
     };
     let effects = evaluate(&request.source, request.input, request.limits);
+    let mut output = serde_json::to_vec(&effects).unwrap_or_default();
+    if output.len() > MAX_EFFECTS_BYTES {
+        output = serde_json::to_vec(&ScriptEffects::failed(
+            "script results are larger than 16 MiB; its effects were discarded",
+        ))
+        .unwrap_or_default();
+    }
     let mut stdout = io::stdout().lock();
-    let written = serde_json::to_writer(&mut stdout, &effects)
-        .map_err(io::Error::from)
-        .and_then(|()| stdout.flush());
+    let written = stdout.write_all(&output).and_then(|()| stdout.flush());
     match written {
         Ok(()) => 0,
         Err(error) => {
@@ -371,9 +393,22 @@ pub fn evaluate(source: &str, input: String, limits: Limits) -> ScriptEffects {
         logs,
         tests: raw.tests,
         // `client.exit()` throws to unwind the script, which is not an error.
-        error: error.filter(|_| !raw.exited),
+        error: error.filter(|_| !raw.exited).map(truncate_error),
         exited: raw.exited,
     }
+}
+
+/// Thrown values can be arbitrarily large; the report only needs the start.
+fn truncate_error(mut error: String) -> String {
+    if error.len() > MAX_ERROR_BYTES {
+        let mut end = MAX_ERROR_BYTES;
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        error.truncate(end);
+        error.push_str("… [truncated]");
+    }
+    error
 }
 
 fn install_api(context: &mut Context, input: String) -> JsResult<()> {

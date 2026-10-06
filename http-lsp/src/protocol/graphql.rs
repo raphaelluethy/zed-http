@@ -60,11 +60,13 @@ pub fn split_variables(text: &str) -> (&str, Option<Value>) {
 }
 
 /// The first named operation (`query Name`, `mutation Name` or `subscription Name`) at the top
-/// level, skipping strings and comments.
+/// level, skipping strings, comments and fragment definitions.
 pub fn operation_name(query: &str) -> Option<String> {
     let mut chars = query.char_indices().peekable();
     let mut depth = 0usize;
     let mut expect_name = false;
+    // Inside `fragment Name on Type { … }`, whose name and type may look like keywords.
+    let mut in_fragment = false;
     while let Some((index, c)) = chars.next() {
         match c {
             '#' => {
@@ -102,7 +104,12 @@ pub fn operation_name(query: &str) -> Option<String> {
                 depth += 1;
                 expect_name = false;
             }
-            '}' | ')' => depth = depth.saturating_sub(1),
+            '}' | ')' => {
+                depth = depth.saturating_sub(1);
+                if c == '}' && depth == 0 {
+                    in_fragment = false;
+                }
+            }
             c if c == '_' || c.is_ascii_alphabetic() => {
                 let mut end = index + c.len_utf8();
                 while let Some((next, c)) = chars.peek() {
@@ -114,10 +121,11 @@ pub fn operation_name(query: &str) -> Option<String> {
                     }
                 }
                 let word = &query[index..end];
-                if depth == 0 {
+                if depth == 0 && !in_fragment {
                     if expect_name {
                         return Some(word.to_owned());
                     }
+                    in_fragment = word == "fragment";
                     expect_name = matches!(word, "query" | "mutation" | "subscription");
                 }
             }
@@ -161,6 +169,13 @@ mod tests {
             operation_name("fragment F on User { id }\nmutation Save { save(note: \"query X\") }")
                 .as_deref(),
             Some("Save")
+        );
+        assert_eq!(
+            operation_name(
+                "fragment query on User @include(if: true) { id }\nquery Real { me { ...query } }"
+            )
+            .as_deref(),
+            Some("Real")
         );
         assert_eq!(operation_name("query { viewer { id } }"), None);
         assert_eq!(operation_name("{ viewer { id } }"), None);
