@@ -1,6 +1,7 @@
 //! Protocol dispatch. Each protocol module exposes `send(&PreparedRequest, &Context)` and
 //! returns a [`Response`]; the runner handles variables, scripts and the report around it.
 
+pub mod grpc;
 pub mod http;
 mod net;
 pub mod websocket;
@@ -93,7 +94,7 @@ pub async fn send(request: &PreparedRequest, context: &Context<'_>) -> Result<Re
         Protocol::Http => http::send(request, context).await,
         Protocol::GraphQl => Err(unsupported("GraphQL")),
         Protocol::WebSocket => websocket::send(request, context).await,
-        Protocol::Grpc => Err(unsupported("gRPC")),
+        Protocol::Grpc => grpc::send(request, context).await,
     }
 }
 

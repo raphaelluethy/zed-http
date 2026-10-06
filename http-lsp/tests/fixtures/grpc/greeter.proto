@@ -1,0 +1,11 @@
+syntax = "proto3";
+
+package test.v1;
+
+import "types.proto";
+
+service Greeter {
+  rpc SayHello (HelloRequest) returns (HelloReply);
+  rpc StreamGreetings (StreamRequest) returns (stream HelloReply);
+  rpc Chat (stream HelloRequest) returns (stream HelloReply);
+}

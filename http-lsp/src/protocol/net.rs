@@ -29,12 +29,15 @@ pub type BoxedIo = Box<dyn Io>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Alpn {
     Http1,
+    Http2,
 }
 
 fn tls_config(alpn: Alpn) -> Result<Arc<ClientConfig>, String> {
     static HTTP1: OnceLock<Result<Arc<ClientConfig>, String>> = OnceLock::new();
+    static HTTP2: OnceLock<Result<Arc<ClientConfig>, String>> = OnceLock::new();
     let (cell, protocol): (_, &[u8]) = match alpn {
         Alpn::Http1 => (&HTTP1, b"http/1.1"),
+        Alpn::Http2 => (&HTTP2, b"h2"),
     };
     cell.get_or_init(|| {
         install_crypto_provider();
