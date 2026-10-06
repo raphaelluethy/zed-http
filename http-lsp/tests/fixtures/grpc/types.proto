@@ -12,6 +12,7 @@ message HelloReply {
   string message = 1;
   int32 index = 2;
   google.protobuf.Timestamp at = 3;
+  repeated int32 values = 4;
 }
 
 message StreamRequest {
