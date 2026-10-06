@@ -143,6 +143,13 @@ async function main() {
     const server = http.createServer((request, response) => {
         seen.push({ url: request.url, authorization: request.headers.authorization });
         response.setHeader("Content-Type", "application/json");
+        if (request.url === "/graphql") {
+            let body = "";
+            request.setEncoding("utf8");
+            request.on("data", (chunk) => (body += chunk));
+            request.on("end", () => response.end(JSON.stringify({ data: JSON.parse(body) })));
+            return;
+        }
         if (request.url === "/prepared") {
             response.end(JSON.stringify({ prepared: true }));
             return;
@@ -167,6 +174,15 @@ async function main() {
             "### Verify the environment",
             "GET {{baseUrl}}/verify",
             "Authorization: Bearer {{smokeToken}}",
+            "",
+            "### GraphQL",
+            "GRAPHQL {{baseUrl}}/graphql",
+            "",
+            "query Smoke {",
+            "  ok",
+            "}",
+            "",
+            '{ "token": "{{smokeToken}}" }',
             "",
         ].join("\n");
         fs.writeFileSync(requestPath, source);
@@ -199,7 +215,7 @@ async function main() {
             textDocument: { uri },
         });
         const sendLenses = lenses.filter((lens) => lens.command?.command === "zed-http.send");
-        assert.equal(sendLenses.length, 2, JSON.stringify(lenses));
+        assert.equal(sendLenses.length, 3, JSON.stringify(lenses));
 
         await client.execute(sendLenses[0].command);
         const loginLenses = await client.request("textDocument/codeLens", { textDocument: { uri } });
@@ -220,9 +236,20 @@ async function main() {
         );
         assert.match(verifyResponse, /HTTP\/1\.1 200 OK/);
         assert.match(verifyResponse, /"authorized": true/);
-        assert.equal(seen.length, 2);
         assert.equal(seen[0].url, "/prepared");
         assert.equal(seen[1].authorization, "Bearer native-runner-token");
+
+        await client.execute(sendLenses[2].command);
+        const graphqlLenses = await client.request("textDocument/codeLens", { textDocument: { uri } });
+        const graphqlResponse = responseFromLens(
+            graphqlLenses,
+            sendLenses[2].range.start.line,
+            "👁 Show",
+        );
+        assert.match(graphqlResponse, /^# GRAPHQL http:\/\/127\.0\.0\.1:\d+\/graphql$/m);
+        assert.match(graphqlResponse, /"operationName": "Smoke"/);
+        assert.match(graphqlResponse, /"token": "native-runner-token"/);
+        assert.equal(seen.length, 3);
 
         await client.stop();
         client = undefined;

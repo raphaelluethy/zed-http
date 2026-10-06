@@ -24,7 +24,6 @@ jobs:
             - run: cargo clippy --locked --workspace --all-targets -- -D warnings
             - run: cargo test --locked --workspace --all-targets
             - run: cargo build --locked --target wasm32-wasip2
-            - run: node scripts/fetch_kulala_core.cjs
             - run: cargo build --locked --package zed-http-lsp
             - run: node scripts/smoke_lsp.cjs
             - name: Verify release versions
@@ -54,34 +53,33 @@ jobs:
                       target: aarch64-apple-darwin
                     - runner: windows-latest
                       target: x86_64-pc-windows-msvc
+                    - runner: windows-11-arm
+                      target: aarch64-pc-windows-msvc
         runs-on: ${{ matrix.runner }}
         steps:
             - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
             - uses: dtolnay/rust-toolchain@75be91dd2711b583df57c31d0873b4145c89f1d9 # 1.94.1
               with:
                   targets: ${{ matrix.target }}
-            - run: node scripts/fetch_kulala_core.cjs --target ${{ matrix.target }}
             - run: cargo build --locked --release --package zed-http-lsp --target ${{ matrix.target }}
             - name: Package Unix server
               if: runner.os != 'Windows'
               shell: bash
               run: |
                   mkdir -p dist
-                  cp target/kulala-core/kulala-core "target/${{ matrix.target }}/release/kulala-core"
                   if [[ "${{ runner.os }}" == "macOS" ]]; then
                     codesign --force --sign - "target/${{ matrix.target }}/release/zed-http-lsp"
                   fi
                   tar -C "target/${{ matrix.target }}/release" \
                     -czf "dist/zed-http-lsp-${{ matrix.target }}.tar.gz" \
-                    zed-http-lsp kulala-core
+                    zed-http-lsp
             - name: Package Windows server
               if: runner.os == 'Windows'
               shell: pwsh
               run: |
                   New-Item -ItemType Directory -Force -Path dist
-                  Copy-Item target/kulala-core/kulala-core.exe "target/${{ matrix.target }}/release/kulala-core.exe"
                   Compress-Archive `
-                    -Path "target/${{ matrix.target }}/release/zed-http-lsp.exe", "target/${{ matrix.target }}/release/kulala-core.exe" `
+                    -Path "target/${{ matrix.target }}/release/zed-http-lsp.exe" `
                     -DestinationPath "dist/zed-http-lsp-${{ matrix.target }}.zip"
             - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
               with:

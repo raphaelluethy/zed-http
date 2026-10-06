@@ -18,7 +18,6 @@ struct HttpExtension {
 struct PlatformAsset {
     archive_name: String,
     binary_name: String,
-    core_binary_name: String,
     file_type: zed::DownloadedFileType,
     make_executable: bool,
 }
@@ -94,14 +93,14 @@ impl HttpExtension {
         }
         let asset = execution_server_asset()?;
         if let Some(path) = &self.cached_execution_server_path {
-            if is_installed(path, &asset) {
+            if is_installed(path) {
                 return Ok(path.clone());
             }
         }
 
         let version_directory = format!("{EXECUTION_SERVER_ID}-{EXECUTION_SERVER_VERSION}");
         let binary_path = format!("{version_directory}/{}", asset.binary_name);
-        if !is_installed(&binary_path, &asset) {
+        if !is_installed(&binary_path) {
             match download_execution_server(language_server_id, &asset, &version_directory) {
                 Ok(()) => remove_old_execution_servers(&version_directory),
                 Err(error) => {
@@ -150,7 +149,6 @@ impl HttpExtension {
         let command = self.execution_server_binary_path(language_server_id, configured_path)?;
 
         let mut command_env = worktree.shell_env();
-        command_env.retain(|(key, _)| key != "KULALA_CORE_PATH");
         if let Some(overrides) = binary_settings.and_then(|settings| settings.env) {
             for (key, value) in overrides {
                 set_env(&mut command_env, key, value);
@@ -200,6 +198,7 @@ fn execution_server_asset_for(
         (zed::Os::Linux, zed::Architecture::Aarch64) => "aarch64-unknown-linux-gnu",
         (zed::Os::Linux, zed::Architecture::X8664) => "x86_64-unknown-linux-gnu",
         (zed::Os::Windows, zed::Architecture::X8664) => "x86_64-pc-windows-msvc",
+        (zed::Os::Windows, zed::Architecture::Aarch64) => "aarch64-pc-windows-msvc",
         (os, architecture) => {
             return Err(format!(
                 "{EXECUTION_SERVER_ID} does not publish a binary for {os:?}/{architecture:?}"
@@ -218,11 +217,6 @@ fn execution_server_asset_for(
         } else {
             EXECUTION_SERVER_ID.to_owned()
         },
-        core_binary_name: if is_windows {
-            "kulala-core.exe".to_owned()
-        } else {
-            "kulala-core".to_owned()
-        },
         file_type: if is_windows {
             zed::DownloadedFileType::Zip
         } else {
@@ -239,8 +233,9 @@ fn download_execution_server(
 ) -> zed::Result<()> {
     let unavailable = |reason: String| {
         format!(
-            "request execution is unavailable because {reason}. Completion and hover from Kulala LS \
-             still work. To use a local build, set `lsp.{EXECUTION_SERVER_ID}.binary.path`."
+            "sending requests is unavailable because {reason}. Completion and hover from Kulala LS \
+             still work. To use a local build of {EXECUTION_SERVER_ID}, set \
+             `lsp.{EXECUTION_SERVER_ID}.binary.path`."
         )
     };
     let tag = format!("v{EXECUTION_SERVER_VERSION}");
@@ -274,17 +269,12 @@ fn download_execution_server(
     )?;
     if asset.make_executable {
         zed::make_file_executable(&format!("{version_directory}/{}", asset.binary_name))?;
-        zed::make_file_executable(&format!("{version_directory}/{}", asset.core_binary_name))?;
     }
     Ok(())
 }
 
-fn is_installed(binary_path: &str, asset: &PlatformAsset) -> bool {
-    let binary_path = Path::new(binary_path);
-    binary_path.is_file()
-        && binary_path
-            .parent()
-            .is_some_and(|directory| directory.join(&asset.core_binary_name).is_file())
+fn is_installed(binary_path: &str) -> bool {
+    Path::new(binary_path).is_file()
 }
 
 fn installed_execution_server_directories() -> Vec<String> {
@@ -301,7 +291,7 @@ fn previously_installed_execution_server(asset: &PlatformAsset) -> Option<String
     installed_execution_server_directories()
         .into_iter()
         .map(|directory| format!("{directory}/{}", asset.binary_name))
-        .filter(|binary_path| is_installed(binary_path, asset))
+        .filter(|binary_path| is_installed(binary_path))
         .max_by_key(|binary_path| version_key(binary_path))
 }
 
@@ -349,7 +339,6 @@ mod tests {
         let mac = execution_server_asset_for(zed::Os::Mac, zed::Architecture::Aarch64).unwrap();
         assert_eq!(mac.archive_name, "zed-http-lsp-aarch64-apple-darwin.tar.gz");
         assert_eq!(mac.binary_name, "zed-http-lsp");
-        assert_eq!(mac.core_binary_name, "kulala-core");
         assert!(mac.make_executable);
 
         let windows =
@@ -359,10 +348,15 @@ mod tests {
             "zed-http-lsp-x86_64-pc-windows-msvc.zip"
         );
         assert_eq!(windows.binary_name, "zed-http-lsp.exe");
-        assert_eq!(windows.core_binary_name, "kulala-core.exe");
         assert!(!windows.make_executable);
 
-        assert!(execution_server_asset_for(zed::Os::Windows, zed::Architecture::Aarch64).is_err());
+        let windows_arm =
+            execution_server_asset_for(zed::Os::Windows, zed::Architecture::Aarch64).unwrap();
+        assert_eq!(
+            windows_arm.archive_name,
+            "zed-http-lsp-aarch64-pc-windows-msvc.zip"
+        );
+        assert_eq!(windows_arm.binary_name, "zed-http-lsp.exe");
     }
 
     #[test]
@@ -378,6 +372,7 @@ mod tests {
         let version_line = format!("version = \"{EXECUTION_SERVER_VERSION}\"");
         assert!(include_str!("../extension.toml").contains(&version_line));
         assert!(include_str!("../http-lsp/Cargo.toml").contains(&version_line));
+        assert!(include_str!("../Cargo.toml").contains(&version_line));
     }
 }
 
