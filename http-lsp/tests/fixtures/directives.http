@@ -1,0 +1,13 @@
+# @no-redirect
+# @no-cookie-jar
+// @no-log
+# @timeout 2 m
+# @connection-timeout 500ms
+GET https://example.test/search
+    ?q=1
+    &page=2
+Accept: */*
+
+###
+# @timeout 180
+https://example.test/bare

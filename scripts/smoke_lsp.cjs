@@ -13,13 +13,6 @@ const lspPath = process.env.ZED_HTTP_LSP ?? path.join(
     "debug",
     process.platform === "win32" ? "zed-http-lsp.exe" : "zed-http-lsp",
 );
-const corePath = process.env.KULALA_CORE_PATH ?? path.join(
-    repositoryRoot,
-    "target",
-    "kulala-core",
-    process.platform === "win32" ? "kulala-core.exe" : "kulala-core",
-);
-const useBundledCore = process.env.ZED_HTTP_USE_BUNDLED_CORE === "1";
 
 class LspClient {
     constructor(command, options) {
@@ -145,12 +138,6 @@ function responseFromLens(lenses, sourceLine, title) {
 
 async function main() {
     assert.ok(fs.existsSync(lspPath), `native LSP not found at ${lspPath}`);
-    if (!useBundledCore) {
-        assert.ok(
-            fs.existsSync(corePath),
-            `Kulala Core not found at ${corePath}; run node scripts/fetch_kulala_core.cjs`,
-        );
-    }
     const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "zed-http-lsp-smoke-"));
     const seen = [];
     const server = http.createServer((request, response) => {
@@ -160,7 +147,7 @@ async function main() {
             response.end(JSON.stringify({ prepared: true }));
             return;
         }
-        const authorized = request.headers.authorization === "Bearer core-sidecar-token";
+        const authorized = request.headers.authorization === "Bearer native-runner-token";
         response.statusCode = authorized ? 200 : 401;
         response.end(JSON.stringify({ authorized }));
     });
@@ -188,20 +175,14 @@ async function main() {
             `${JSON.stringify({
                 smoke: {
                     baseUrl: `http://127.0.0.1:${port}`,
-                    smokeToken: "core-sidecar-token",
+                    smokeToken: "native-runner-token",
                 },
             }, null, 2)}\n`,
         );
 
-        const childEnvironment = {
-            ...process.env,
-            ZED_HTTP_ENV: "smoke",
-        };
-        if (useBundledCore) delete childEnvironment.KULALA_CORE_PATH;
-        else childEnvironment.KULALA_CORE_PATH = corePath;
         client = new LspClient(lspPath, {
             cwd: temporary,
-            env: childEnvironment,
+            env: { ...process.env, ZED_HTTP_ENV: "smoke" },
         });
         const uri = pathToFileURL(requestPath).href;
         await client.request("initialize", {
@@ -241,11 +222,11 @@ async function main() {
         assert.match(verifyResponse, /"authorized": true/);
         assert.equal(seen.length, 2);
         assert.equal(seen[0].url, "/prepared");
-        assert.equal(seen[1].authorization, "Bearer core-sidecar-token");
+        assert.equal(seen[1].authorization, "Bearer native-runner-token");
 
         await client.stop();
         client = undefined;
-        console.log("Core sidecar smoke test passed: code lenses execute unsaved requests through Kulala Core.");
+        console.log("Native runner smoke test passed: code lenses execute unsaved requests in-process.");
     } finally {
         if (client) client.child.kill();
         await new Promise((resolve) => server.close(resolve));

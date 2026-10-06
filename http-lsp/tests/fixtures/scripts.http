@@ -1,0 +1,20 @@
+###
+< {%
+  // ### not a separator
+  request.variables.set("id", "7");
+%}
+< ./pre.js
+POST https://example.test/items/{{id}}
+
+{"ok": true}
+
+> {% client.log(1) %}
+> handlers/after.js
+>>! ./out.json
+
+### Second
+GET https://example.test/second
+> {%
+  client.test("ok", () => client.assert(response.status === 200));
+%}
+>> ./second.json

@@ -1,0 +1,29 @@
+PATCH https://example.test/xml
+Content-Type: application/xml
+
+<?xml version="1.0" encoding="UTF-8"?>
+<user>
+  <status>active</status>
+</user>
+
+###
+POST https://example.test/includes
+
+prefix
+< ./raw.json
+<@ ./template.json
+
+###
+POST https://example.test/upload
+Content-Type: multipart/form-data; boundary="WebBoundary"
+
+--WebBoundary
+Content-Disposition: form-data; name="field"
+
+value
+--WebBoundary
+Content-Disposition: form-data; name="file"; filename="upload.txt"
+Content-Type: text/plain
+
+< ./upload.txt
+--WebBoundary--

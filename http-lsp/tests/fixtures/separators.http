@@ -1,0 +1,23 @@
+# first block has no separator
+GET https://example.test/first
+
+### Separator name
+POST https://example.test/second HTTP/1.1
+Content-Type: application/json
+
+{
+  "a": 1
+}
+
+### Ignored separator name
+# @name commentName
+// plain comment
+DELETE https://example.test/third
+
+###
+// @name = equalsName
+PURGE https://example.test/fourth
+X-Trace: 1
+
+
+# end

@@ -1,0 +1,11 @@
+@host = https://example.test
+@token = {{login.response.body.$.token}}
+import ./other.http
+
+run #Login (@user=admin)
+run ./setup.http
+
+###
+GRAPHQL {{host}}/graphql
+
+query { viewer { id } }

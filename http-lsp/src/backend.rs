@@ -17,7 +17,12 @@ use tokio::{
 };
 use tower_lsp::{jsonrpc::Result as LspResult, lsp_types::*, Client, LanguageServer};
 
-use crate::core::{CoreClient, CoreReport, OutputView, RequestBlock, RunSummary};
+use crate::{
+    report::{OutputView, Report, RunSummary},
+    runner::Runner,
+    session::Session,
+    syntax::{self, RequestBlock},
+};
 
 const CMD_SEND: &str = "zed-http.send";
 const CMD_SEND_ALL: &str = "zed-http.sendAll";
@@ -33,7 +38,7 @@ struct OpenDocument {
 
 #[derive(Clone)]
 struct CachedResponse {
-    report: Arc<CoreReport>,
+    report: Arc<Report>,
     full_uri: Url,
     headers_uri: Url,
 }
@@ -41,7 +46,7 @@ struct CachedResponse {
 #[derive(Clone)]
 pub struct Backend {
     client: Client,
-    core: Result<CoreClient, String>,
+    runner: Arc<Runner>,
     documents: Arc<RwLock<HashMap<Url, OpenDocument>>>,
     cache: Arc<RwLock<HashMap<(Url, u32), CachedResponse>>>,
     execution_lock: Arc<Mutex<()>>,
@@ -54,7 +59,7 @@ impl Backend {
     pub fn new(client: Client) -> Self {
         Self {
             client,
-            core: CoreClient::discover(),
+            runner: Arc::new(Runner::new(Session::new())),
             documents: Arc::new(RwLock::new(HashMap::new())),
             cache: Arc::new(RwLock::new(HashMap::new())),
             execution_lock: Arc::new(Mutex::new(())),
@@ -68,10 +73,6 @@ impl Backend {
         }
     }
 
-    fn core(&self) -> Result<&CoreClient, String> {
-        self.core.as_ref().map_err(Clone::clone)
-    }
-
     async fn store_document(&self, uri: Url, text: String) {
         self.documents.write().await.insert(
             uri,
@@ -82,29 +83,23 @@ impl Backend {
         );
     }
 
-    async fn request_blocks(&self, uri: &Url) -> Result<Option<Vec<RequestBlock>>, String> {
-        let Some((text, cached)) = self
+    async fn request_blocks(&self, uri: &Url) -> Option<Vec<RequestBlock>> {
+        let (text, cached) = self
             .documents
             .read()
             .await
             .get(uri)
-            .map(|document| (document.text.clone(), document.requests.clone()))
-        else {
-            return Ok(None);
-        };
+            .map(|document| (document.text.clone(), document.requests.clone()))?;
         if let Some(requests) = cached {
-            return Ok(Some(requests));
+            return Some(requests);
         }
-        let path = uri
-            .to_file_path()
-            .map_err(|()| format!("cannot parse non-file URI {uri}"))?;
-        let document = self.core()?.parse(&path, &text).await?;
+        let document = syntax::parse(&text);
         if let Some(error) = document.error_summary() {
             self.client
                 .log_message(MessageType::WARNING, format!("zed-http: {error}"))
                 .await;
         }
-        let requests = document.request_blocks();
+        let requests = document.blocks;
 
         let mut documents = self.documents.write().await;
         if let Some(open_document) = documents.get_mut(uri) {
@@ -112,7 +107,7 @@ impl Backend {
                 open_document.requests = Some(requests.clone());
             }
         }
-        Ok(Some(requests))
+        Some(requests)
     }
 
     async fn remove_cached_document(&self, uri: &Url) {
@@ -145,6 +140,7 @@ impl Backend {
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
+        self.runner.set_workspace_roots(workspace_roots(&params));
         let work_done_progress = params
             .capabilities
             .window
@@ -177,24 +173,9 @@ impl LanguageServer for Backend {
     }
 
     async fn initialized(&self, _params: InitializedParams) {
-        match &self.core {
-            Ok(core) => {
-                self.client
-                    .log_message(
-                        MessageType::INFO,
-                        format!(
-                            "zed-http execution adapter ready; using Kulala Core at {}",
-                            core.executable().display()
-                        ),
-                    )
-                    .await;
-            }
-            Err(error) => {
-                self.client
-                    .log_message(MessageType::ERROR, format!("zed-http: {error}"))
-                    .await;
-            }
-        }
+        self.client
+            .log_message(MessageType::INFO, "zed-http execution adapter ready")
+            .await;
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
@@ -222,24 +203,14 @@ impl LanguageServer for Backend {
 
     async fn code_lens(&self, params: CodeLensParams) -> LspResult<Option<Vec<CodeLens>>> {
         let uri = params.text_document.uri;
-        let requests = match self.request_blocks(&uri).await {
-            Ok(Some(requests)) => requests,
-            Ok(None) => return Ok(None),
-            Err(error) => {
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("zed-http: could not index {uri}: {error}"),
-                    )
-                    .await;
-                return Ok(Some(Vec::new()));
-            }
+        let Some(requests) = self.request_blocks(&uri).await else {
+            return Ok(None);
         };
         let cache = self.cache.read().await;
         let mut lenses = Vec::with_capacity(requests.len() * 4 + 1);
 
         for (index, request) in requests.iter().enumerate() {
-            let line = request.lsp_line();
+            let line = request.start_line;
             let range = line_range(line);
             if index == 0 {
                 lenses.push(lens(range, "▶ Send All", CMD_SEND_ALL, &uri, line));
@@ -342,19 +313,14 @@ impl Backend {
             .get(uri)
             .map(|document| document.text.clone())
             .ok_or_else(|| format!("cannot execute unopened document {uri}"))?;
-        let core = self.core()?.clone();
 
         let report = {
             let _execution_guard = self.execution_lock.lock().await;
             let environment = env::var("ZED_HTTP_ENV").ok();
             Arc::new(
-                core.run(
-                    &path,
-                    &text,
-                    line.map(|line| line.saturating_add(1)),
-                    environment.as_deref(),
-                )
-                .await?,
+                self.runner
+                    .run(&path, &text, line, environment.as_deref())
+                    .await?,
             )
         };
 
@@ -460,7 +426,7 @@ impl Backend {
         &self,
         uri: &Url,
         line: u32,
-        report: &CoreReport,
+        report: &Report,
         view: OutputView,
         directory: &Path,
     ) -> Result<Url, String> {
@@ -517,6 +483,20 @@ async fn write_private_file(path: &Path, body: &[u8]) -> Result<(), String> {
     file.flush()
         .await
         .map_err(|error| format!("failed to flush {}: {error}", path.display()))
+}
+
+/// Workspace folders bound the env file search; `rootUri` is the fallback for older clients.
+#[allow(deprecated)]
+fn workspace_roots(params: &InitializeParams) -> Vec<PathBuf> {
+    let folders = params
+        .workspace_folders
+        .iter()
+        .flatten()
+        .map(|folder| &folder.uri);
+    folders
+        .chain(params.root_uri.as_ref())
+        .filter_map(|uri| uri.to_file_path().ok())
+        .collect()
 }
 
 fn full_document_text(changes: &[TextDocumentContentChangeEvent]) -> Option<&str> {
