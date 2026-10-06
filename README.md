@@ -72,6 +72,7 @@ Inside the adapter:
 - OAuth 2.0 (`$auth.token`), client certificates and proxy settings from env files, HTTP/3 and the IntelliJ example server are not supported.
 - GraphQL `operationName` is taken from the first named operation in the query and cannot be chosen explicitly.
 - gRPC client-streaming and bidirectional-streaming methods are not supported, and descriptors (reflection or `.proto` compilation) are resolved again for every request.
+- gRPC `google.protobuf.Any` payloads only resolve when their type is in a file the service's descriptors already include.
 - The cookie jar, `@no-cookie-jar` and `@no-redirect` apply to HTTP and GraphQL only: WebSocket handshakes and gRPC calls neither send nor store session cookies. `@no-log` applies to every protocol.
 
 ## Installation and use
