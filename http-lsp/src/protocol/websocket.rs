@@ -1,8 +1,11 @@
 //! WebSocket over tokio-tungstenite. The body is split into messages on `===` lines; a
 //! `=== wait-for-server` line makes the next message wait for one server message first. After
 //! the last message is sent, server messages are collected until the connection has been idle
-//! for a while (2 s, or `@timeout`), bounded by an overall cap (30 s, or `@timeout` if longer),
-//! a message count and a byte budget. The exchange renders as a `→`/`←` transcript.
+//! for 2 s, within an overall cap of 30 s for the whole exchange. An explicit `@timeout` replaces
+//! both: the exchange then ends after that long, or after that long without a server message.
+//! Collection is also bounded by a message count and a byte budget. A `wait-for-server` that is
+//! never satisfied, or messages left unsent, fail the request. The exchange renders as a `→`/`←`
+//! transcript.
 
 use std::{
     fmt::Write as _,
@@ -203,21 +206,23 @@ pub async fn send(request: &PreparedRequest, _context: &Context<'_>) -> Result<R
 
     let directives = &request.directives;
     let idle = directives.timeout.unwrap_or(DEFAULT_IDLE);
-    let cap = directives
-        .timeout
-        .map_or(DEFAULT_CAP, |timeout| timeout.max(DEFAULT_CAP));
+    let cap = directives.timeout.unwrap_or(DEFAULT_CAP);
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + cap;
 
-    let stream = net::connect(
-        &host,
-        port,
-        tls.then_some(Alpn::Http1),
-        directives
-            .connection_timeout
-            .unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+    let stream = timeout_at(
+        deadline,
+        net::connect(
+            &host,
+            port,
+            tls.then_some(Alpn::Http1),
+            directives
+                .connection_timeout
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT),
+        ),
     )
-    .await?;
+    .await
+    .map_err(|_| format!("timed out connecting to {host}:{port}"))??;
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_BODY_BYTES))
         .max_frame_size(Some(MAX_BODY_BYTES));
@@ -260,50 +265,67 @@ pub async fn send(request: &PreparedRequest, _context: &Context<'_>) -> Result<R
     };
 
     let mut transcript = Transcript::default();
-    let mut stop = None;
-    'frames: for frame in &frames {
+    let mut error = None;
+    let mut closed = false;
+    // Messages are sent and awaited first; any failure here fails the request.
+    'frames: for (sent, frame) in frames.iter().enumerate() {
         for _ in 0..frame.waits {
-            if let Err(reason) = receive(&mut socket, &mut transcript, deadline).await {
-                stop = Some(reason);
+            if let Err(stop) = receive(&mut socket, &mut transcript, deadline).await {
+                closed = matches!(stop, Stop::Closed);
+                error = Some(unmet_wait(stop, frames.len() - sent, cap));
                 break 'frames;
             }
         }
-        if let Err(error) = socket.send(Message::text(frame.text.clone())).await {
-            stop = Some(Stop::Failed(format!(
-                "failed to send a message: {}",
-                error_chain(&error)
-            )));
-            break;
+        match timeout_at(deadline, socket.send(Message::text(frame.text.clone()))).await {
+            Ok(Ok(())) => {}
+            Ok(Err(failure)) => {
+                error = Some(format!(
+                    "failed to send a message: {}",
+                    error_chain(&failure)
+                ));
+                break;
+            }
+            Err(_) => {
+                error = Some(format!(
+                    "timed out after {} sending a message; the server is not reading",
+                    seconds(cap)
+                ));
+                break;
+            }
         }
         transcript.push("→", &frame.text);
     }
-    if stop.is_none() {
+    if error.is_none() {
         for _ in 0..trailing_waits {
-            if let Err(reason) = receive(&mut socket, &mut transcript, deadline).await {
-                stop = Some(reason);
+            if let Err(stop) = receive(&mut socket, &mut transcript, deadline).await {
+                closed = matches!(stop, Stop::Closed);
+                error = Some(unmet_wait(stop, 0, cap));
                 break;
             }
         }
     }
-    if stop.is_none() {
-        stop = loop {
+    // Then whatever else the server sends is collected until it goes quiet.
+    if error.is_none() {
+        loop {
             let idle_deadline = (tokio::time::Instant::now() + idle).min(deadline);
-            if let Err(reason) = receive(&mut socket, &mut transcript, idle_deadline).await {
-                break Some(reason);
-            }
-        };
-    }
-
-    let closed = matches!(stop, Some(Stop::Closed));
-    let mut error = None;
-    match stop {
-        Some(Stop::Closed) => {}
-        Some(Stop::Failed(message)) => error = Some(message),
-        Some(Stop::TimedOut) | None => {
-            if tokio::time::Instant::now() >= deadline {
-                transcript
-                    .text
-                    .push_str(&format!("# stopped listening after {} s\n", cap.as_secs()));
+            match receive(&mut socket, &mut transcript, idle_deadline).await {
+                Ok(()) => {}
+                Err(Stop::Closed) => {
+                    closed = true;
+                    break;
+                }
+                Err(Stop::Failed(message)) => {
+                    error = Some(message);
+                    break;
+                }
+                Err(Stop::TimedOut) => {
+                    if tokio::time::Instant::now() >= deadline {
+                        transcript
+                            .text
+                            .push_str(&format!("# stopped listening after {}\n", seconds(cap)));
+                    }
+                    break;
+                }
             }
         }
     }
@@ -327,6 +349,24 @@ pub async fn send(request: &PreparedRequest, _context: &Context<'_>) -> Result<R
         elapsed: started.elapsed(),
         error,
     })
+}
+
+/// The error for a `wait-for-server` that was not satisfied.
+fn unmet_wait(stop: Stop, unsent: usize, cap: Duration) -> String {
+    let reason = match stop {
+        Stop::Failed(message) => return message,
+        Stop::TimedOut => format!("no server message arrived within {}", seconds(cap)),
+        Stop::Closed => "the server closed the connection".to_owned(),
+    };
+    match unsent {
+        0 => format!("wait-for-server not satisfied: {reason}"),
+        1 => format!("wait-for-server not satisfied: {reason}; 1 message was not sent"),
+        n => format!("wait-for-server not satisfied: {reason}; {n} messages were not sent"),
+    }
+}
+
+fn seconds(duration: Duration) -> String {
+    format!("{} s", duration.as_secs_f64())
 }
 
 /// Sends a close frame and waits briefly for the server to acknowledge it.
