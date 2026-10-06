@@ -12,8 +12,11 @@ use serde_json::Value;
 use crate::{
     protocol::{self, http::Clients, Context, PreparedBody, PreparedRequest, Response},
     report::{Body, ExecutedRequest, Execution, Report, ScriptConsoleEntry, Timings},
+    script::{
+        ScriptEffects, ScriptEngine, ScriptInput, ScriptRequest, ScriptResponse, MAX_SOURCE_BYTES,
+    },
     session::{NamedResponse, Session},
-    syntax::{self, BodyPart, Header, RequestBlock},
+    syntax::{self, BodyPart, Header, RequestBlock, Script},
     variables::{self, Environment, Variables},
 };
 
@@ -23,6 +26,7 @@ const MAX_REPORT_BODY_BYTES: usize = 64 * 1024 * 1024;
 pub struct Runner {
     session: Arc<Session>,
     http: Clients,
+    scripts: ScriptEngine,
     workspace_roots: RwLock<Vec<PathBuf>>,
 }
 
@@ -40,6 +44,7 @@ impl Runner {
         Self {
             session,
             http,
+            scripts: ScriptEngine::default(),
             workspace_roots: RwLock::new(Vec::new()),
         }
     }
@@ -116,18 +121,28 @@ impl Runner {
             block_name: block.name.clone().unwrap_or_default(),
             ..Execution::default()
         };
-        let variables = Variables {
+        let mut variables = Variables {
             request: BTreeMap::new(),
             globals: self.session.globals(),
             file: context.file_vars.clone(),
             environment: context.environment.variables.clone(),
         };
 
-        if !block.pre_scripts.is_empty() || !block.handlers.is_empty() {
-            execution.script_console.push(ScriptConsoleEntry::log(
-                "warn",
-                "scripts are not yet supported",
-            ));
+        for script in &block.pre_scripts {
+            let input = ScriptInput {
+                globals: variables.globals.clone(),
+                request_variables: variables.request.clone(),
+                environment: context.environment.variables.clone(),
+                request: script_request(block, &variables),
+                response: None,
+            };
+            let effects = self.run_script(script, &input, context).await;
+            variables.request.extend(effects.request_variables.clone());
+            if let Some(error) = self.apply_effects(effects, &mut execution) {
+                execution.error = Some(format!("pre-request script failed: {error}"));
+                return execution;
+            }
+            variables.globals = self.session.globals();
         }
 
         let mut unresolved = Vec::new();
@@ -162,6 +177,38 @@ impl Runner {
             }
         };
         let body_value = fill_response(&mut execution, &response);
+
+        if !block.handlers.is_empty() {
+            let input = ScriptInput {
+                globals: self.session.globals(),
+                request_variables: variables.request.clone(),
+                environment: context.environment.variables.clone(),
+                request: ScriptRequest {
+                    method: request.method.clone(),
+                    url: request.url.clone(),
+                    headers: request
+                        .headers
+                        .iter()
+                        .map(|header| (header.name.clone(), header.value.clone()))
+                        .collect(),
+                },
+                response: Some(ScriptResponse {
+                    status: response.status,
+                    headers: response.headers.clone(),
+                    body: body_value.clone(),
+                    content_type: response.content_type.clone(),
+                }),
+            };
+            for script in &block.handlers {
+                let mut input = input.clone();
+                input.globals = self.session.globals();
+                let effects = self.run_script(script, &input, context).await;
+                if self.apply_effects(effects, &mut execution).is_some() {
+                    execution.success = false;
+                }
+            }
+        }
+
         if let Some(name) = &block.name {
             self.session.store_response(
                 name,
@@ -174,6 +221,82 @@ impl Runner {
         }
         execution
     }
+
+    async fn run_script(
+        &self,
+        script: &Script,
+        input: &ScriptInput,
+        context: &RunContext<'_>,
+    ) -> ScriptEffects {
+        let source = match script {
+            Script::Inline { source, .. } => source.clone(),
+            Script::File { path, .. } => match read_script(&context.base_dir.join(path)).await {
+                Ok(source) => source,
+                Err(error) => {
+                    return ScriptEffects {
+                        error: Some(error),
+                        ..ScriptEffects::default()
+                    }
+                }
+            },
+        };
+        self.scripts.run(source, input).await
+    }
+
+    /// Applies globals and moves output into the console. Returns the script error, if any;
+    /// effects made before the error are still applied.
+    fn apply_effects(&self, effects: ScriptEffects, execution: &mut Execution) -> Option<String> {
+        self.session.apply_globals(&effects.globals);
+        let console = &mut execution.script_console;
+        for log in effects.logs {
+            console.push(ScriptConsoleEntry::log(log.level, log.message));
+        }
+        for test in effects.tests {
+            let name = match test.message {
+                Some(message) if !test.passed => format!("{}: {message}", test.name),
+                _ => test.name,
+            };
+            console.push(ScriptConsoleEntry::test(name, test.passed));
+        }
+        if let Some(error) = &effects.error {
+            console.push(ScriptConsoleEntry::log("error", error.clone()));
+        }
+        effects.error
+    }
+}
+
+/// The request as a pre-request script sees it, substituted with the variables known so far.
+fn script_request(block: &RequestBlock, variables: &Variables) -> ScriptRequest {
+    ScriptRequest {
+        method: block.method.clone(),
+        url: variables.substitute(&block.url).text,
+        headers: block
+            .headers
+            .iter()
+            .map(|header| {
+                (
+                    variables.substitute(&header.name).text,
+                    variables.substitute(&header.value).text,
+                )
+            })
+            .collect(),
+    }
+}
+
+async fn read_script(path: &Path) -> Result<String, String> {
+    let metadata = tokio::fs::metadata(path)
+        .await
+        .map_err(|error| format!("failed to read script {}: {error}", path.display()))?;
+    if metadata.len() > MAX_SOURCE_BYTES as u64 {
+        return Err(format!(
+            "script {} is larger than {} KiB",
+            path.display(),
+            MAX_SOURCE_BYTES / 1024
+        ));
+    }
+    tokio::fs::read_to_string(path)
+        .await
+        .map_err(|error| format!("failed to read script {}: {error}", path.display()))
 }
 
 /// Substitutes variables and resolves the body. Unresolved names are collected, not fatal.
