@@ -10,12 +10,15 @@ const KULALA_SERVER_PATH: &str = "node_modules/@mistweaverco/kulala-ls/cli.cjs";
 const EXECUTION_SERVER_ID: &str = "zed-http-lsp";
 const EXECUTION_SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASE_REPOSITORY: &str = "raphaelluethy/zed-http";
+/// Marks the directory a download is extracted into before it is renamed into place.
+const STAGING: &str = "staging";
 
 struct HttpExtension {
     cached_execution_server_path: Option<String>,
 }
 
 struct PlatformAsset {
+    target: String,
     archive_name: String,
     binary_name: String,
     file_type: zed::DownloadedFileType,
@@ -98,11 +101,11 @@ impl HttpExtension {
             }
         }
 
-        let version_directory = format!("{EXECUTION_SERVER_ID}-{EXECUTION_SERVER_VERSION}");
+        let version_directory = install_directory(&asset.target, EXECUTION_SERVER_VERSION);
         let binary_path = format!("{version_directory}/{}", asset.binary_name);
         if !is_installed(&binary_path) {
             match download_execution_server(language_server_id, &asset, &version_directory) {
-                Ok(()) => remove_old_execution_servers(&version_directory),
+                Ok(()) => remove_old_execution_servers(&version_directory, &asset.target),
                 Err(error) => {
                     // Keep request execution working offline or when a release is not yet
                     // published by falling back to a previously downloaded adapter.
@@ -208,6 +211,7 @@ fn execution_server_asset_for(
     let is_windows = os == zed::Os::Windows;
 
     Ok(PlatformAsset {
+        target: target.to_owned(),
         archive_name: format!(
             "{EXECUTION_SERVER_ID}-{target}.{}",
             if is_windows { "zip" } else { "tar.gz" }
@@ -259,22 +263,63 @@ fn download_execution_server(
         language_server_id,
         &LanguageServerInstallationStatus::Downloading,
     );
-    zed::download_file(&archive.download_url, version_directory, asset.file_type).map_err(
-        |error| {
-            unavailable(format!(
-                "downloading {} failed ({error})",
-                asset.archive_name
-            ))
-        },
-    )?;
-    if asset.make_executable {
-        zed::make_file_executable(&format!("{version_directory}/{}", asset.binary_name))?;
+    // Extract into a staging directory and rename it into place only once the binary is
+    // complete, so an interrupted download is never mistaken for an installation.
+    let staging = format!("{EXECUTION_SERVER_ID}-{STAGING}-{}", asset.target);
+    remove_path(&staging);
+    zed::download_file(&archive.download_url, &staging, asset.file_type).map_err(|error| {
+        remove_path(&staging);
+        unavailable(format!(
+            "downloading {} failed ({error})",
+            asset.archive_name
+        ))
+    })?;
+    let staged_binary = format!("{staging}/{}", asset.binary_name);
+    if !fs::metadata(&staged_binary).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    {
+        remove_path(&staging);
+        return Err(unavailable(format!(
+            "{} did not contain {}",
+            asset.archive_name, asset.binary_name
+        )));
     }
+    if asset.make_executable {
+        zed::make_file_executable(&staged_binary)?;
+    }
+    remove_path(version_directory);
+    fs::rename(&staging, version_directory).map_err(|error| {
+        remove_path(&staging);
+        unavailable(format!("installing {version_directory} failed ({error})"))
+    })?;
     Ok(())
 }
 
 fn is_installed(binary_path: &str) -> bool {
-    Path::new(binary_path).is_file()
+    fs::metadata(binary_path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+}
+
+/// Installs are kept per target triple, because Zed running natively and under Rosetta share
+/// the extension directory: `zed-http-lsp-<target>-<version>`.
+fn install_directory(target: &str, version: &str) -> String {
+    format!("{EXECUTION_SERVER_ID}-{target}-{version}")
+}
+
+/// Splits an install directory name into its target (absent for installs made before 0.0.4)
+/// and numeric version. Staging directories and other names yield `None`.
+fn parse_install(name: &str) -> Option<(Option<&str>, Vec<u64>)> {
+    let rest = name.strip_prefix(&format!("{EXECUTION_SERVER_ID}-"))?;
+    if rest.starts_with(&format!("{STAGING}-")) {
+        return None;
+    }
+    let (target, version) = match rest.rsplit_once('-') {
+        Some((target, version)) => (Some(target), version),
+        None => (None, rest),
+    };
+    let version = version
+        .split('.')
+        .map(|part| part.parse().ok())
+        .collect::<Option<Vec<u64>>>()?;
+    Some((target, version))
 }
 
 fn installed_execution_server_directories() -> Vec<String> {
@@ -283,39 +328,56 @@ fn installed_execution_server_directories() -> Vec<String> {
     };
     entries
         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
-        .filter(|name| name.starts_with(&format!("{EXECUTION_SERVER_ID}-")))
+        .filter(|name| parse_install(name).is_some())
         .collect()
 }
 
 fn previously_installed_execution_server(asset: &PlatformAsset) -> Option<String> {
     installed_execution_server_directories()
         .into_iter()
-        .map(|directory| format!("{directory}/{}", asset.binary_name))
-        .filter(|binary_path| is_installed(binary_path))
-        .max_by_key(|binary_path| version_key(binary_path))
+        .filter_map(|directory| {
+            let (target, version) = parse_install(&directory)?;
+            let binary_path = format!("{directory}/{}", asset.binary_name);
+            (target == Some(asset.target.as_str()) && is_installed(&binary_path))
+                .then_some((version, binary_path))
+        })
+        .max()
+        .map(|(_, binary_path)| binary_path)
 }
 
-fn version_key(binary_path: &str) -> Vec<u64> {
-    binary_path
-        .split('/')
-        .next()
-        .and_then(|directory| directory.strip_prefix(&format!("{EXECUTION_SERVER_ID}-")))
-        .unwrap_or_default()
-        .split('.')
-        .map(|part| part.parse().unwrap_or(0))
-        .collect()
+/// Installs to delete after `active` was installed: everything for this target (or from before
+/// targets were recorded) except the newest previous one, which a language server started
+/// before the update may still be running and spawning script workers from. Other targets'
+/// installs belong to another Zed (native or Rosetta) and are left alone.
+fn stale_installs(names: &[String], active: &str, target: &str) -> Vec<String> {
+    let mut previous: Vec<(Vec<u64>, &String)> = names
+        .iter()
+        .filter(|name| name.as_str() != active)
+        .filter_map(|name| {
+            let (install_target, version) = parse_install(name)?;
+            install_target
+                .is_none_or(|install_target| install_target == target)
+                .then_some((version, name))
+        })
+        .collect();
+    previous.sort();
+    previous.pop();
+    previous.into_iter().map(|(_, name)| name.clone()).collect()
 }
 
-fn remove_old_execution_servers(active_version_directory: &str) {
-    for name in installed_execution_server_directories() {
-        if name != active_version_directory {
-            let path = Path::new(&name);
-            if path.is_dir() {
-                fs::remove_dir_all(path).ok();
-            } else {
-                fs::remove_file(path).ok();
-            }
-        }
+fn remove_old_execution_servers(active_version_directory: &str, target: &str) {
+    let names = installed_execution_server_directories();
+    for name in stale_installs(&names, active_version_directory, target) {
+        remove_path(&name);
+    }
+}
+
+fn remove_path(name: &str) {
+    let path = Path::new(name);
+    if path.is_dir() {
+        fs::remove_dir_all(path).ok();
+    } else if path.exists() {
+        fs::remove_file(path).ok();
     }
 }
 
@@ -360,10 +422,52 @@ mod tests {
     }
 
     #[test]
-    fn orders_installed_versions_numerically() {
-        assert!(
-            version_key("zed-http-lsp-0.0.10/zed-http-lsp")
-                > version_key("zed-http-lsp-0.0.9/zed-http-lsp")
+    fn parses_install_directories() {
+        assert_eq!(
+            install_directory("aarch64-apple-darwin", "0.0.4"),
+            "zed-http-lsp-aarch64-apple-darwin-0.0.4"
+        );
+        assert_eq!(
+            parse_install("zed-http-lsp-aarch64-apple-darwin-0.0.10"),
+            Some((Some("aarch64-apple-darwin"), vec![0, 0, 10]))
+        );
+        assert_eq!(
+            parse_install("zed-http-lsp-0.0.3"),
+            Some((None, vec![0, 0, 3]))
+        );
+        assert_eq!(
+            parse_install("zed-http-lsp-staging-aarch64-apple-darwin"),
+            None
+        );
+        assert_eq!(parse_install("kulala-ls"), None);
+    }
+
+    #[test]
+    fn keeps_the_active_and_previous_install_for_the_target() {
+        let names: Vec<String> = [
+            "zed-http-lsp-0.0.3",
+            "zed-http-lsp-aarch64-apple-darwin-0.0.9",
+            "zed-http-lsp-aarch64-apple-darwin-0.0.10",
+            "zed-http-lsp-aarch64-apple-darwin-0.0.11",
+            "zed-http-lsp-x86_64-apple-darwin-0.0.4",
+            "zed-http-lsp-staging-aarch64-apple-darwin",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let mut stale = stale_installs(
+            &names,
+            "zed-http-lsp-aarch64-apple-darwin-0.0.11",
+            "aarch64-apple-darwin",
+        );
+        stale.sort();
+        // 0.0.10 is kept for a language server that may still be running it; the Rosetta
+        // (x86_64) install belongs to another Zed.
+        assert_eq!(
+            stale,
+            vec![
+                "zed-http-lsp-0.0.3",
+                "zed-http-lsp-aarch64-apple-darwin-0.0.9"
+            ]
         );
     }
 
