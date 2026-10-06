@@ -1,6 +1,7 @@
 //! HTTP over reqwest with rustls. Redirect policy, timeouts and cookie saving are client-level
 //! settings in reqwest, so one client is cached per combination; all of them share the session's
-//! cookie jar.
+//! cookie jar. Idle connections are pooled briefly and sparingly, and the cache is bounded, so
+//! requests to many hosts cannot exhaust file descriptors (macOS allows 256 by default).
 
 use std::{
     collections::HashMap,
@@ -20,6 +21,10 @@ use super::{
 };
 
 const MAX_REDIRECTS: usize = 10;
+/// Distinct `@timeout` values can create many clients; past this the cache starts over.
+const MAX_CACHED_CLIENTS: usize = 16;
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const POOL_MAX_IDLE_PER_HOST: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum VersionPreference {
@@ -59,11 +64,14 @@ impl Clients {
         if let Some(client) = cache.get(&key) {
             return Ok(client.clone());
         }
-        let mut builder = Client::builder().redirect(if key.follow_redirects {
-            redirect::Policy::limited(MAX_REDIRECTS)
-        } else {
-            redirect::Policy::none()
-        });
+        let mut builder = Client::builder()
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+            .redirect(if key.follow_redirects {
+                redirect::Policy::limited(MAX_REDIRECTS)
+            } else {
+                redirect::Policy::none()
+            });
         builder = if key.save_cookies {
             builder.cookie_provider(Arc::clone(&self.cookies))
         } else {
@@ -83,6 +91,10 @@ impl Clients {
         let client = builder
             .build()
             .map_err(|error| format!("failed to create an HTTP client: {}", error_chain(&error)))?;
+        if cache.len() >= MAX_CACHED_CLIENTS {
+            // Dropping a client closes its idle connections; in-flight requests keep theirs.
+            cache.clear();
+        }
         cache.insert(key, client.clone());
         Ok(client)
     }
@@ -197,4 +209,27 @@ pub async fn send(request: &PreparedRequest, context: &Context<'_>) -> Result<Re
         elapsed: started.elapsed(),
         error,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounds_the_client_cache() {
+        let clients = Clients::new(Arc::new(Jar::default()));
+        for seconds in 0..(MAX_CACHED_CLIENTS as u64 * 2 + 3) {
+            clients
+                .client(ClientKey {
+                    follow_redirects: true,
+                    save_cookies: true,
+                    connect_timeout: None,
+                    read_timeout: Some(Duration::from_secs(seconds + 1)),
+                    version: VersionPreference::Any,
+                })
+                .unwrap();
+            let cached = clients.cache.lock().unwrap().len();
+            assert!(cached <= MAX_CACHED_CLIENTS, "{cached}");
+        }
+    }
 }
