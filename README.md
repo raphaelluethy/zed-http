@@ -41,7 +41,7 @@ Inside the adapter:
 - Response buffers with full, headers-only, reopen and save actions
 - IntelliJ-style requests:
   - `###` separators, `# @name`, request lines with an optional HTTP version, multi-line URLs and headers
-  - `@no-redirect`, `@no-cookie-jar`, `@no-log`, `@timeout` and `@connection-timeout`
+  - `@no-redirect`, `@no-cookie-jar`, `@no-log`, `@timeout` and `@connection-timeout`. For HTTP and GraphQL, `@timeout` is an inactivity timeout: it ends a request that receives nothing for that long, so slow streams keep going, and the whole request is still capped at 5 minutes or the timeout, whichever is longer. For WebSocket and gRPC it bounds the whole exchange. Durations are seconds, or take an `ms`, `s` or `m` suffix.
   - inline bodies, `< file` and `<@ file` includes, and multipart bodies
 - Variables:
   - `http-client.env.json` and `http-client.private.env.json`, including `$shared`
@@ -58,7 +58,7 @@ Inside the adapter:
 
 ### WebSocket
 
-`WEBSOCKET ws://…` (or `wss://`) opens a connection with the request headers on the handshake. The body is split into messages on `===` lines, and `=== wait-for-server` waits for one server message before the next is sent. After the last message, server messages are collected until the connection has been idle for 2 seconds, with a 30 second overall cap. `@timeout` overrides the idle time and raises the cap. The exchange renders as `→` / `←` lines.
+`WEBSOCKET ws://…` (or `wss://`) opens a connection with the request headers on the handshake. The body is split into messages on `===` lines, and `=== wait-for-server` waits for one server message before the next is sent. After the last message, server messages are collected until the connection has been idle for 2 seconds, with a 30 second cap on the whole exchange. An explicit `@timeout` replaces both: the exchange ends after that long, or after that long without a server message. The exchange renders as `→` / `←` lines.
 
 ### gRPC
 

@@ -185,28 +185,38 @@ async fn bounds_script_results() {
 }
 
 /// A worker that floods stdout is killed as soon as it passes the limit instead of blocking
-/// until the wall clock runs out.
+/// until the wall clock runs out. `sh -c 'exec yes'` floods without creating an executable,
+/// which sibling tests forking concurrently could hold open (ETXTBSY).
 #[cfg(unix)]
 #[tokio::test]
 async fn kills_workers_that_flood_stdout() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let directory = std::env::temp_dir().join(format!("zed-http-flood-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
-    let worker = directory.join("flood");
-    std::fs::write(&worker, "#!/bin/sh\nexec yes\n").unwrap();
-    std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let engine = zed_http_lsp::script::ScriptEngine::new(
+    let engine = zed_http_lsp::script::ScriptEngine::with_command(
         Limits {
             wall_clock: Duration::from_secs(30),
             ..Limits::default()
         },
-        worker,
+        std::path::PathBuf::from("sh"),
+        vec!["-c".into(), "exec yes".into()],
     );
     let started = Instant::now();
     let effects = engine.run(String::new(), &ScriptInput::default()).await;
     let error = effects.error.unwrap();
     assert!(error.contains("larger than 16 MiB"), "{error}");
     assert!(started.elapsed() < Duration::from_secs(10));
-    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[tokio::test]
+async fn explains_a_missing_worker() {
+    let engine = zed_http_lsp::script::ScriptEngine::new(
+        Limits::default(),
+        std::path::PathBuf::from("/nonexistent/zed-http-lsp"),
+    );
+    let effects = engine
+        .run("client.log(1)".to_owned(), &ScriptInput::default())
+        .await;
+    let error = effects.error.unwrap();
+    assert!(
+        error.contains("restart the zed-http-lsp language server"),
+        "{error}"
+    );
 }

@@ -11,6 +11,7 @@
 use std::{
     collections::BTreeMap,
     env,
+    ffi::OsString,
     io::{self, Read as _, Write as _},
     path::PathBuf,
     process::Stdio,
@@ -103,8 +104,6 @@ pub struct ScriptEffects {
     pub request_variables: BTreeMap<String, String>,
     pub logs: Vec<ScriptLog>,
     pub tests: Vec<ScriptTest>,
-    /// `client.exit()` ended the script early.
-    pub exited: bool,
     pub error: Option<String>,
 }
 
@@ -134,6 +133,7 @@ impl ScriptEffects {
 pub struct ScriptEngine {
     limits: Limits,
     worker: PathBuf,
+    worker_args: Vec<OsString>,
     workers: Arc<Semaphore>,
 }
 
@@ -157,9 +157,15 @@ struct WorkerRequest {
 impl ScriptEngine {
     /// `worker` is an executable that runs [`worker_main`] when given [`WORKER_FLAG`].
     pub fn new(limits: Limits, worker: PathBuf) -> Self {
+        Self::with_command(limits, worker, vec![OsString::from(WORKER_FLAG)])
+    }
+
+    /// Runs workers as `program args…` instead of `worker --script-worker`.
+    pub fn with_command(limits: Limits, program: PathBuf, args: Vec<OsString>) -> Self {
         Self {
             limits,
-            worker,
+            worker: program,
+            worker_args: args,
             workers: Arc::new(Semaphore::new(MAX_CONCURRENT_SCRIPTS)),
         }
     }
@@ -198,15 +204,19 @@ impl ScriptEngine {
 
     async fn run_worker(&self, request: Vec<u8>) -> Result<ScriptEffects, String> {
         let mut child = Command::new(&self.worker)
-            .arg(WORKER_FLAG)
+            .args(&self.worker_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|error| {
+                // The worker is the adapter binary itself, which an extension update can
+                // replace or remove while the language server keeps running.
                 format!(
-                    "failed to start the script worker {}: {error}",
+                    "failed to start the script worker {}: {error}. The adapter binary may have \
+                     been replaced by an extension update; restart the zed-http-lsp language \
+                     server",
                     self.worker.display()
                 )
             })?;
@@ -394,7 +404,6 @@ pub fn evaluate(source: &str, input: String, limits: Limits) -> ScriptEffects {
         tests: raw.tests,
         // `client.exit()` throws to unwind the script, which is not an error.
         error: error.filter(|_| !raw.exited).map(truncate_error),
-        exited: raw.exited,
     }
 }
 
@@ -636,7 +645,6 @@ mod tests {
             ScriptInput::default(),
         );
         assert_eq!(effects.error, None);
-        assert!(effects.exited);
         assert_eq!(
             effects.globals,
             vec![GlobalChange::Set("before".to_owned(), json!(1))]
