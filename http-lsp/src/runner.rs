@@ -93,7 +93,10 @@ impl Runner {
         }
     }
 
+    /// Roots are canonicalized once, like request file paths, so prefix checks agree when the
+    /// same directory has several spellings (macOS `/var` is `/private/var`, symlinks).
     pub fn set_workspace_roots(&self, roots: Vec<PathBuf>) {
+        let roots = roots.iter().map(|root| normalize(root)).collect();
         *self
             .workspace_roots
             .write()
@@ -116,13 +119,15 @@ impl Runner {
         line: Option<u32>,
         configured_environment: Option<&str>,
     ) -> Result<Report, String> {
+        // The edited file may be unsaved, so only its directory is canonicalized.
+        let path = canonical_location(path);
         let mut state = RunState {
             workspace_roots: self.workspace_roots(),
             environment: configured_environment.map(str::to_owned),
-            stack: vec![normalize(path)],
+            stack: vec![path.clone()],
             report: Report::default(),
         };
-        let frame = load_frame(path.to_path_buf(), syntax::parse(text), &state)?;
+        let frame = load_frame(path, syntax::parse(text), &state)?;
         let steps = select_steps(&frame.document, line)?;
         self.run_steps(&frame, steps, &BTreeMap::new(), &mut state)
             .await;
@@ -564,8 +569,20 @@ fn load_frame(path: PathBuf, document: Document, state: &RunState) -> Result<Fil
     })
 }
 
+/// The canonical path, or the path as given when it cannot be resolved.
 fn normalize(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Canonicalizes the parent directory and keeps the file name, which need not exist yet.
+fn canonical_location(path: &Path) -> PathBuf {
+    if let Ok(path) = std::fs::canonicalize(path) {
+        return path;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => normalize(parent).join(name),
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Substitutes variables and resolves the body. Unresolved names are collected, not fatal.

@@ -247,3 +247,38 @@ async fn scopes_run_overrides_to_nested_commands() {
         vec!["outer", "outer", "inner", "outer", "env-token"]
     );
 }
+
+/// macOS reaches temp directories through `/var` → `/private/var`, so the workspace root and
+/// the request path can spell the same directory differently. Both spellings must agree.
+#[cfg(unix)]
+#[tokio::test]
+async fn matches_workspace_roots_across_symlinked_spellings() {
+    let address = start_server().await;
+    let workspace = Workspace::new(address);
+    let nested = workspace.root.join("api");
+    fs::create_dir_all(&nested).unwrap();
+    let link = workspace.root.with_extension("link");
+    std::os::unix::fs::symlink(&workspace.root, &link).unwrap();
+    let text = "GET {{baseUrl}}/json?token={{token}}\n";
+
+    for (root, file) in [
+        (link.clone(), nested.join("requests.http")),
+        (
+            workspace.root.clone(),
+            link.join("api").join("requests.http"),
+        ),
+    ] {
+        let runner = zed_http_lsp::runner::Runner::new(zed_http_lsp::session::Session::new());
+        runner.set_workspace_roots(vec![root.clone()]);
+        let report = runner.run(&file, text, None, Some("test")).await.unwrap();
+        // The env file sits at the root, above the request's directory.
+        assert_eq!(
+            report.executions[0].request.as_ref().unwrap().url,
+            format!("http://{address}/json?token=env-token"),
+            "root {} with file {}",
+            root.display(),
+            file.display()
+        );
+    }
+    fs::remove_file(link).unwrap();
+}

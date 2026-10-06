@@ -157,6 +157,8 @@ impl Workspace {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
+        // macOS temp directories live behind the `/var` → `/private/var` symlink.
+        let root = fs::canonicalize(&root).unwrap();
         fs::write(
             root.join("http-client.env.json"),
             json!({
