@@ -8,12 +8,15 @@ const path = require("node:path");
 const { fileURLToPath, pathToFileURL } = require("node:url");
 
 const repositoryRoot = path.join(__dirname, "..");
-const lspPath = process.env.ZED_HTTP_LSP ?? path.join(
+// The server runs with a temporary working directory, so a relative override must be resolved
+// against ours first.
+const lspPath = path.resolve(process.env.ZED_HTTP_LSP ?? path.join(
     repositoryRoot,
     "target",
     "debug",
     process.platform === "win32" ? "zed-http-lsp.exe" : "zed-http-lsp",
-);
+));
+const SHUTDOWN_DEADLINE_MS = 10_000;
 
 class LspClient {
     constructor(command, options) {
@@ -29,6 +32,23 @@ class LspClient {
         this.child.stderr.setEncoding("utf8");
         this.child.stderr.on("data", (chunk) => (this.stderr += chunk));
         this.child.stdout.on("data", (chunk) => this.receive(chunk));
+        this.exited = false;
+        // A server that fails to start or dies fails every outstanding request immediately.
+        this.child.on("error", (error) => this.fail(new Error(`failed to start ${command}: ${error.message}`)));
+        this.child.stdin.on("error", (error) => this.fail(new Error(`server stdin closed: ${error.message}\n${this.stderr}`)));
+        this.child.on("exit", (code, signal) => {
+            this.exited = true;
+            this.fail(new Error(`server exited (code ${code}, signal ${signal})\n${this.stderr}`));
+        });
+    }
+
+    fail(error) {
+        for (const [id, pending] of this.pending) {
+            clearTimeout(pending.timer);
+            pending.reject(error);
+            this.pending.delete(id);
+        }
+        this.settleExecution(error);
     }
 
     send(message) {
@@ -116,11 +136,29 @@ class LspClient {
     }
 
     async stop() {
-        await this.request("shutdown");
-        const closed = new Promise((resolve) => this.child.once("close", resolve));
-        this.notify("exit");
-        this.child.stdin.end();
-        await closed;
+        const closed = this.exited
+            ? Promise.resolve()
+            : new Promise((resolve) => this.child.once("close", resolve));
+        let timer;
+        const deadline = new Promise((_, reject) => {
+            timer = setTimeout(
+                () => reject(new Error(`server did not shut down within ${SHUTDOWN_DEADLINE_MS} ms`)),
+                SHUTDOWN_DEADLINE_MS,
+            );
+        });
+        try {
+            await Promise.race([
+                (async () => {
+                    await this.request("shutdown");
+                    this.notify("exit");
+                    this.child.stdin.end();
+                    await closed;
+                })(),
+                deadline,
+            ]);
+        } finally {
+            clearTimeout(timer);
+        }
     }
 }
 
@@ -210,7 +248,11 @@ async function main() {
         response.end(JSON.stringify({ authorized }));
     });
 
+    // Upgraded sockets are not tracked by server.close(), so destroy them explicitly.
+    const sockets = new Set();
     server.on("upgrade", (request, socket) => {
+        sockets.add(socket);
+        socket.once("close", () => sockets.delete(socket));
         seen.push({ url: request.url, authorization: request.headers.authorization });
         acceptWebSocket(request, socket);
     });
@@ -241,7 +283,7 @@ async function main() {
             '{ "token": "{{smokeToken}}" }',
             "",
             "### WebSocket",
-            "# @timeout 300ms",
+            "# @timeout 2s",
             "WEBSOCKET {{wsUrl}}/socket",
             "",
             "===",
@@ -332,6 +374,8 @@ async function main() {
         console.log("Native runner smoke test passed: code lenses execute unsaved requests in-process.");
     } finally {
         if (client) client.child.kill();
+        for (const socket of sockets) socket.destroy();
+        server.closeAllConnections?.();
         await new Promise((resolve) => server.close(resolve));
         fs.rmSync(temporary, { recursive: true, force: true });
     }

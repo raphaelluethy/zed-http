@@ -56,6 +56,9 @@ jobs:
                     - runner: windows-11-arm
                       target: aarch64-pc-windows-msvc
         runs-on: ${{ matrix.runner }}
+        env:
+            # Only Apple targets read this; it keeps the binary loadable on macOS 11 and later.
+            MACOSX_DEPLOYMENT_TARGET: "11.0"
         steps:
             - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
             - uses: dtolnay/rust-toolchain@75be91dd2711b583df57c31d0873b4145c89f1d9 # 1.94.1
@@ -67,8 +70,13 @@ jobs:
               shell: bash
               run: |
                   mkdir -p dist
+                  binary="target/${{ matrix.target }}/release/zed-http-lsp"
                   if [[ "${{ runner.os }}" == "macOS" ]]; then
-                    codesign --force --sign - "target/${{ matrix.target }}/release/zed-http-lsp"
+                    codesign --force --sign - "$binary"
+                    codesign --verify --verbose "$binary"
+                    lipo -info "$binary"
+                    otool -L "$binary"
+                    otool -l "$binary" | grep -A4 LC_BUILD_VERSION || true
                   fi
                   tar -C "target/${{ matrix.target }}/release" \
                     -czf "dist/zed-http-lsp-${{ matrix.target }}.tar.gz" \

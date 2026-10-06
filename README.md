@@ -152,3 +152,31 @@ cargo build --locked --target wasm32-wasip2
 cargo build --locked --package zed-http-lsp
 node scripts/smoke_lsp.cjs
 ```
+
+### Testing on macOS
+
+The adapter supports Apple Silicon and Intel Macs (macOS 11 or later). On a Mac, run the tests and the end-to-end smoke test:
+
+```bash
+cargo test --workspace
+cargo build -p zed-http-lsp && node scripts/smoke_lsp.cjs
+```
+
+To try a release build the way the extension ships it, build and ad-hoc sign it:
+
+```bash
+cargo build --release -p zed-http-lsp
+codesign --force --sign - target/release/zed-http-lsp
+codesign --verify --verbose target/release/zed-http-lsp
+```
+
+Then install this checkout with **zed: install dev extension** and point `lsp.zed-http-lsp.binary.path` at `target/release/zed-http-lsp` (or `target/debug/zed-http-lsp`), as shown above.
+
+Zed downloads release binaries into `~/Library/Application Support/Zed/extensions/work/http/zed-http-lsp-<target>-<version>/`. The current and the previous version are kept, so a language server started before an update keeps working until it restarts. If macOS refuses to run a downloaded binary, check it for a quarantine attribute and remove it:
+
+```bash
+xattr -l ~/Library/Application\ Support/Zed/extensions/work/http/zed-http-lsp-*/zed-http-lsp
+xattr -d com.apple.quarantine ~/Library/Application\ Support/Zed/extensions/work/http/zed-http-lsp-*/zed-http-lsp
+```
+
+On macOS, HTTPS, WebSocket and gRPC certificates are verified against the system Keychain (through rustls-platform-verifier), so certificates trusted there, including corporate roots, are accepted.
