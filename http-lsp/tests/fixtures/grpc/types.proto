@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package test.v1;
+
+import "google/protobuf/timestamp.proto";
+
+message HelloRequest {
+  string name = 1;
+}
+
+message HelloReply {
+  string message = 1;
+  int32 index = 2;
+  google.protobuf.Timestamp at = 3;
+}
+
+message StreamRequest {
+  string name = 1;
+  int32 count = 2;
+}

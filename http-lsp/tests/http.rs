@@ -146,10 +146,7 @@ GET http://127.0.0.1:1/unreachable
         rendered.contains("# warning: unresolved variable {{missing}}"),
         "{rendered}"
     );
-    assert!(
-        rendered.contains("error: WebSocket requests are not yet supported"),
-        "{rendered}"
-    );
+    assert!(report.executions[1].error.is_some(), "{rendered}");
     assert!(report.executions[2].error.is_some());
     assert_eq!(report.summary().failed, 2);
 }

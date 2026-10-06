@@ -2,7 +2,10 @@
 //! returns a [`Response`]; the runner handles variables, scripts and the report around it.
 
 pub mod graphql;
+pub mod grpc;
 pub mod http;
+mod net;
+pub mod websocket;
 
 use std::{
     path::{Path, PathBuf},
@@ -91,8 +94,8 @@ pub async fn send(request: &PreparedRequest, context: &Context<'_>) -> Result<Re
     match Protocol::of(&request.method) {
         Protocol::Http => http::send(request, context).await,
         Protocol::GraphQl => Err(unsupported("GraphQL")),
-        Protocol::WebSocket => Err(unsupported("WebSocket")),
-        Protocol::Grpc => Err(unsupported("gRPC")),
+        Protocol::WebSocket => websocket::send(request, context).await,
+        Protocol::Grpc => grpc::send(request, context).await,
     }
 }
 
