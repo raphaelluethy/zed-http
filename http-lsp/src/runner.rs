@@ -2,32 +2,72 @@
 //! handlers → report.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{Arc, RwLock},
 };
 
 use serde_json::Value;
 
 use crate::{
-    protocol::{self, http::Clients, Context, PreparedBody, PreparedRequest, Response},
+    body,
+    protocol::{self, graphql, http::Clients, Context, PreparedRequest, Protocol, Response},
     report::{Body, ExecutedRequest, Execution, Report, ScriptConsoleEntry, Timings},
     script::{
         ScriptEffects, ScriptEngine, ScriptInput, ScriptRequest, ScriptResponse, MAX_SOURCE_BYTES,
     },
     session::{NamedResponse, Session},
-    syntax::{self, BodyPart, Header, RequestBlock, Script},
+    syntax::{self, Document, Header, RequestBlock, RunCommand, RunTarget, Script},
     variables::{self, Environment, Variables},
 };
 
 /// Bodies beyond this total are left out of a Send All report to keep response files sane.
 const MAX_REPORT_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Bounds `run ./file.http` nesting and the files searched through `import`.
+const MAX_RUN_DEPTH: usize = 8;
+const MAX_IMPORTED_FILES: usize = 32;
+const MAX_HTTP_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+type BoxFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 pub struct Runner {
     session: Arc<Session>,
     http: Clients,
     scripts: ScriptEngine,
     workspace_roots: RwLock<Vec<PathBuf>>,
+}
+
+/// One `.http` file taking part in a run: the edited file, a `run ./file.http` target or a file
+/// reached through `import`.
+struct FileFrame {
+    path: PathBuf,
+    document: Document,
+    environment: Environment,
+    file_vars: BTreeMap<String, String>,
+}
+
+impl FileFrame {
+    fn base_dir(&self) -> &Path {
+        self.path.parent().unwrap_or_else(|| Path::new("."))
+    }
+}
+
+/// What a run executes, in document order.
+#[derive(Clone, Copy)]
+enum Step<'a> {
+    Block(&'a RequestBlock),
+    Run(&'a RunCommand),
+}
+
+/// Mutable state threaded through nested runs.
+struct RunState {
+    workspace_roots: Vec<PathBuf>,
+    environment: Option<String>,
+    /// Files currently executing through `run ./file.http`, to stop cycles.
+    stack: Vec<PathBuf>,
+    report: Report,
 }
 
 /// Per-run state shared by every block.
@@ -63,7 +103,8 @@ impl Runner {
             .clone()
     }
 
-    /// Runs the block containing the 0-based `line`, or every block when `line` is `None`.
+    /// Runs the block or `run` command at the 0-based `line`, or everything when `line` is
+    /// `None`.
     pub async fn run(
         &self,
         path: &Path,
@@ -71,36 +112,20 @@ impl Runner {
         line: Option<u32>,
         configured_environment: Option<&str>,
     ) -> Result<Report, String> {
-        let document = syntax::parse(text);
-        let blocks: Vec<&RequestBlock> = match line {
-            Some(line) => vec![document
-                .block_at(line)
-                .ok_or_else(|| format!("no request found at line {}", line + 1))?],
-            None => document.blocks.iter().collect(),
+        let mut state = RunState {
+            workspace_roots: self.workspace_roots(),
+            environment: configured_environment.map(str::to_owned),
+            stack: vec![normalize(path)],
+            report: Report::default(),
         };
-        if blocks.is_empty() {
-            return Err("no requests found in this file".to_owned());
-        }
+        let frame = load_frame(path.to_path_buf(), syntax::parse(text), &state)?;
+        let steps = select_steps(&frame.document, line)?;
+        self.run_steps(&frame, steps, &BTreeMap::new(), &mut state)
+            .await;
 
-        let workspace_roots = self.workspace_roots();
-        let environment =
-            variables::load_environment(path, &workspace_roots, configured_environment)?;
-        let file_vars = document
-            .file_vars
-            .iter()
-            .map(|variable| (variable.name.clone(), variable.value.clone()))
-            .collect();
-        let context = RunContext {
-            base_dir: path.parent().unwrap_or_else(|| Path::new(".")),
-            workspace_roots: &workspace_roots,
-            environment: &environment,
-            file_vars: &file_vars,
-        };
-
-        let mut report = Report::default();
+        let mut report = state.report;
         let mut body_bytes = 0;
-        for block in blocks {
-            let mut execution = self.execute(block, &context).await;
+        for execution in &mut report.executions {
             if let Some(body) = execution.body.as_mut() {
                 body_bytes += body.formatted.as_ref().map_or(0, String::len);
                 if body_bytes > MAX_REPORT_BODY_BYTES {
@@ -111,9 +136,104 @@ impl Runner {
                     body.content = None;
                 }
             }
-            report.executions.push(execution);
         }
         Ok(report)
+    }
+
+    fn run_steps<'a>(
+        &'a self,
+        frame: &'a FileFrame,
+        steps: Vec<Step<'a>>,
+        overrides: &'a BTreeMap<String, String>,
+        state: &'a mut RunState,
+    ) -> BoxFuture<'a> {
+        Box::pin(async move {
+            for step in steps {
+                match step {
+                    Step::Block(block) => {
+                        let execution = self.execute_in(frame, block, overrides, state).await;
+                        state.report.executions.push(execution);
+                    }
+                    Step::Run(command) => self.run_command(frame, command, state).await,
+                }
+            }
+        })
+    }
+
+    async fn execute_in(
+        &self,
+        frame: &FileFrame,
+        block: &RequestBlock,
+        overrides: &BTreeMap<String, String>,
+        state: &RunState,
+    ) -> Execution {
+        let mut file_vars = frame.file_vars.clone();
+        file_vars.extend(overrides.clone());
+        let context = RunContext {
+            base_dir: frame.base_dir(),
+            workspace_roots: &state.workspace_roots,
+            environment: &frame.environment,
+            file_vars: &file_vars,
+        };
+        self.execute(block, &context).await
+    }
+
+    /// `run #Name` executes a named request from this file or its imports; `run ./file.http`
+    /// executes every request in another file. `(@name=value)` overrides file variables.
+    async fn run_command(&self, frame: &FileFrame, command: &RunCommand, state: &mut RunState) {
+        let overrides: BTreeMap<String, String> = command.overrides.iter().cloned().collect();
+        let failure = match &command.target {
+            RunTarget::Request(name) => {
+                if let Some(block) = find_named(&frame.document, name) {
+                    let execution = self.execute_in(frame, block, &overrides, state).await;
+                    state.report.executions.push(execution);
+                    return;
+                }
+                match find_imported(frame, name, state) {
+                    Ok(Some((imported, index))) => {
+                        let block = &imported.document.blocks[index];
+                        let execution = self.execute_in(&imported, block, &overrides, state).await;
+                        state.report.executions.push(execution);
+                        return;
+                    }
+                    Ok(None) => format!("no request named {name:?} in this file or its imports"),
+                    Err(error) => error,
+                }
+            }
+            RunTarget::File(path) => {
+                let target = normalize(&frame.base_dir().join(path));
+                if state.stack.contains(&target) {
+                    format!(
+                        "{} is already running; run cycles are not allowed",
+                        target.display()
+                    )
+                } else if state.stack.len() >= MAX_RUN_DEPTH {
+                    format!("run commands are nested more than {MAX_RUN_DEPTH} levels deep")
+                } else {
+                    match read_document(&target)
+                        .and_then(|document| load_frame(target.clone(), document, state))
+                    {
+                        Ok(nested) => {
+                            let steps = select_steps(&nested.document, None).unwrap_or_default();
+                            state.stack.push(target);
+                            self.run_steps(&nested, steps, &overrides, state).await;
+                            state.stack.pop();
+                            return;
+                        }
+                        Err(error) => error,
+                    }
+                }
+            }
+        };
+        let target = match &command.target {
+            RunTarget::Request(name) => format!("#{name}"),
+            RunTarget::File(path) => path.clone(),
+        };
+        state.report.executions.push(Execution {
+            block_name: format!("run {target}"),
+            error: Some(failure),
+            ..Execution::default()
+        });
     }
 
     async fn execute(&self, block: &RequestBlock, context: &RunContext<'_>) -> Execution {
@@ -126,6 +246,7 @@ impl Runner {
             globals: self.session.globals(),
             file: context.file_vars.clone(),
             environment: context.environment.variables.clone(),
+            responses: self.session.responses(),
         };
 
         for script in &block.pre_scripts {
@@ -146,7 +267,7 @@ impl Runner {
         }
 
         let mut unresolved = Vec::new();
-        let request = prepare(block, &variables, &mut unresolved);
+        let request = prepare(block, &variables, context.base_dir, &mut unresolved);
         execution.warnings = unresolved
             .iter()
             .map(|name| format!("unresolved variable {{{{{name}}}}}"))
@@ -159,7 +280,7 @@ impl Runner {
             }
         };
         execution.request = Some(ExecutedRequest {
-            method: request.method.clone(),
+            method: block.method.clone(),
             url: request.url.clone(),
         });
 
@@ -177,6 +298,28 @@ impl Runner {
             }
         };
         let body_value = fill_response(&mut execution, &response);
+        if let Some(redirect) = &block.redirect {
+            let path = variables.substitute(&redirect.path).text;
+            match body::write_redirect(context.base_dir, &path, redirect.overwrite, &response.body)
+            {
+                Ok(target) => execution
+                    .notes
+                    .push(format!("saved response body to {}", target.display())),
+                Err(error) => {
+                    execution.success = false;
+                    execution
+                        .warnings
+                        .push(format!("response redirect failed: {error}"));
+                }
+            }
+        }
+        if block.directives.no_log {
+            execution.body = Some(Body {
+                formatted: Some("<response body not logged (@no-log)>".to_owned()),
+                content: None,
+            });
+            execution.raw_body.clear();
+        }
 
         if !block.handlers.is_empty() {
             let input = ScriptInput {
@@ -299,10 +442,125 @@ async fn read_script(path: &Path) -> Result<String, String> {
         .map_err(|error| format!("failed to read script {}: {error}", path.display()))
 }
 
+/// Blocks and `run` commands in document order, or the one at `line`.
+fn select_steps(document: &Document, line: Option<u32>) -> Result<Vec<Step<'_>>, String> {
+    let steps = match line {
+        Some(line) => {
+            let run = document.runs.iter().find(|run| run.line == line);
+            match run {
+                Some(run) => vec![Step::Run(run)],
+                None => {
+                    vec![Step::Block(document.block_at(line).ok_or_else(|| {
+                        format!("no request found at line {}", line + 1)
+                    })?)]
+                }
+            }
+        }
+        None => {
+            let mut steps: Vec<(u32, Step<'_>)> = document
+                .blocks
+                .iter()
+                .map(|block| (block.start_line, Step::Block(block)))
+                .chain(document.runs.iter().map(|run| (run.line, Step::Run(run))))
+                .collect();
+            steps.sort_by_key(|(line, _)| *line);
+            steps.into_iter().map(|(_, step)| step).collect()
+        }
+    };
+    if steps.is_empty() {
+        return Err("no requests found in this file".to_owned());
+    }
+    Ok(steps)
+}
+
+fn find_named<'a>(document: &'a Document, name: &str) -> Option<&'a RequestBlock> {
+    document
+        .blocks
+        .iter()
+        .find(|block| block.name.as_deref() == Some(name))
+}
+
+/// Searches `import`ed files breadth first, following their imports too. Each file is read at
+/// most once, which also stops import cycles.
+fn find_imported(
+    frame: &FileFrame,
+    name: &str,
+    state: &RunState,
+) -> Result<Option<(FileFrame, usize)>, String> {
+    let mut visited = vec![normalize(&frame.path)];
+    let mut queue: VecDeque<PathBuf> = frame
+        .document
+        .imports
+        .iter()
+        .map(|import| frame.base_dir().join(&import.path))
+        .collect();
+    while let Some(path) = queue.pop_front() {
+        let path = normalize(&path);
+        if visited.contains(&path) {
+            continue;
+        }
+        if visited.len() > MAX_IMPORTED_FILES {
+            return Err(format!(
+                "imports reach more than {MAX_IMPORTED_FILES} files"
+            ));
+        }
+        visited.push(path.clone());
+        let document = read_document(&path)?;
+        if let Some(index) = document
+            .blocks
+            .iter()
+            .position(|block| block.name.as_deref() == Some(name))
+        {
+            return load_frame(path, document, state).map(|frame| Some((frame, index)));
+        }
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        queue.extend(
+            document
+                .imports
+                .iter()
+                .map(|import| base_dir.join(&import.path)),
+        );
+    }
+    Ok(None)
+}
+
+fn read_document(path: &Path) -> Result<Document, String> {
+    let size = std::fs::metadata(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?
+        .len();
+    if size > MAX_HTTP_FILE_BYTES {
+        return Err(format!("{} is larger than 16 MiB", path.display()));
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    Ok(syntax::parse(&text))
+}
+
+fn load_frame(path: PathBuf, document: Document, state: &RunState) -> Result<FileFrame, String> {
+    let environment =
+        variables::load_environment(&path, &state.workspace_roots, state.environment.as_deref())?;
+    let file_vars = document
+        .file_vars
+        .iter()
+        .map(|variable| (variable.name.clone(), variable.value.clone()))
+        .collect();
+    Ok(FileFrame {
+        path,
+        document,
+        environment,
+        file_vars,
+    })
+}
+
+fn normalize(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Substitutes variables and resolves the body. Unresolved names are collected, not fatal.
 fn prepare(
     block: &RequestBlock,
     variables: &Variables,
+    base_dir: &Path,
     unresolved: &mut Vec<String>,
 ) -> Result<PreparedRequest, String> {
     let mut substitute = |text: &str| {
@@ -323,32 +581,19 @@ fn prepare(
             value: substitute(&header.value),
         })
         .collect();
-    let body = match &block.body {
-        syntax::Body::Parts(parts) if parts.is_empty() => PreparedBody::Empty,
-        syntax::Body::Parts(parts) => {
-            let mut text = Vec::with_capacity(parts.len());
-            for part in parts {
-                match part {
-                    BodyPart::Text(part) => text.push(substitute(part)),
-                    BodyPart::File { .. } => {
-                        return Err("file includes in bodies are not yet supported".to_owned())
-                    }
-                }
-            }
-            PreparedBody::Bytes(text.join("\n").into_bytes())
-        }
-        syntax::Body::Multipart { .. } => {
-            return Err("multipart bodies are not yet supported".to_owned())
-        }
-    };
-    Ok(PreparedRequest {
+    let body = body::prepare(&block.body, base_dir, &mut substitute)?;
+    let request = PreparedRequest {
         method: block.method.clone(),
         url,
         http_version: block.http_version.clone(),
         headers,
         body,
         directives: block.directives.clone(),
-    })
+    };
+    if Protocol::of(&block.method) == Protocol::GraphQl {
+        return graphql::into_http(request);
+    }
+    Ok(request)
 }
 
 /// Copies a protocol response into the report and returns the body as scripts and named
@@ -427,6 +672,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::protocol::PreparedBody;
 
     #[test]
     fn formats_json_text_and_binary_bodies() {
@@ -460,7 +706,13 @@ mod tests {
             ..Variables::default()
         };
         let mut unresolved = Vec::new();
-        let request = prepare(&document.blocks[0], &variables, &mut unresolved).unwrap();
+        let request = prepare(
+            &document.blocks[0],
+            &variables,
+            Path::new("."),
+            &mut unresolved,
+        )
+        .unwrap();
         assert_eq!(request.url, "http://example.test/items");
         assert_eq!(request.headers[0].value, "{{token}}");
         assert_eq!(

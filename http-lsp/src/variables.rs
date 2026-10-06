@@ -1,16 +1,18 @@
 //! Environment files, variable layers, dynamic variables and `{{ }}` substitution.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     env, fs,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Map, Value};
+use serde_json_path::JsonPath;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::report::value_text;
+use crate::{report::value_text, session::NamedResponse};
 
 pub const PUBLIC_ENV_FILE: &str = "http-client.env.json";
 pub const PRIVATE_ENV_FILE: &str = "http-client.private.env.json";
@@ -136,6 +138,8 @@ pub struct Variables {
     /// File `@name = value` definitions.
     pub file: BTreeMap<String, String>,
     pub environment: BTreeMap<String, String>,
+    /// Last responses of named requests, for `{{name.response.…}}` references.
+    pub responses: HashMap<String, Arc<NamedResponse>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -153,6 +157,45 @@ impl Variables {
             .or_else(|| self.globals.get(name).map(value_text))
             .or_else(|| self.file.get(name).cloned())
             .or_else(|| self.environment.get(name).cloned())
+            .or_else(|| self.response_reference(name))
+    }
+
+    /// `name.response.body.<JSONPath>` (`$` or `*` for the whole body) and
+    /// `name.response.headers.<Header>` (case-insensitive).
+    fn response_reference(&self, reference: &str) -> Option<String> {
+        let (name, rest) = reference.split_once(".response.")?;
+        let response = self.responses.get(name)?;
+        if let Some(header) = rest.strip_prefix("headers.") {
+            return response
+                .headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(header))
+                .map(|(_, value)| value.clone());
+        }
+        let path = rest.strip_prefix("body")?;
+        let path = match path.strip_prefix('.') {
+            Some(path) => path,
+            None if path.is_empty() => "$",
+            None => return None,
+        };
+        // Bodies that were not served as JSON may still be JSON.
+        let parsed;
+        let body = match &response.body {
+            Value::String(text) if path != "$" && path != "*" => {
+                parsed = serde_json::from_str::<Value>(text).ok()?;
+                &parsed
+            }
+            body => body,
+        };
+        if path == "$" || path == "*" {
+            return Some(value_text(body));
+        }
+        let path = JsonPath::parse(path).ok()?;
+        match path.query(body).all().as_slice() {
+            [] => None,
+            [value] => Some(value_text(value)),
+            values => serde_json::to_string(values).ok(),
+        }
     }
 
     /// Replaces every `{{name}}`. Resolved values are substituted recursively; dynamic variables
@@ -333,6 +376,7 @@ mod tests {
                 ("c".to_owned(), "env".to_owned()),
                 ("d".to_owned(), "env".to_owned()),
             ]),
+            ..Variables::default()
         };
         assert_eq!(
             variables.substitute("{{a}} {{ b }} {{c}} {{d}}").text,
@@ -414,6 +458,51 @@ mod tests {
             "https://example.test/{{missing}}/{{missing}}/{{loop}} {{ unclosed"
         );
         assert_eq!(result.unresolved, vec!["missing", "loop"]);
+    }
+
+    #[test]
+    fn resolves_named_response_references() {
+        let response = |body: Value| {
+            Arc::new(NamedResponse {
+                status: Some(200),
+                headers: vec![("x-token".to_owned(), "header-token".to_owned())],
+                body,
+            })
+        };
+        let variables = Variables {
+            responses: HashMap::from([
+                (
+                    "login".to_owned(),
+                    response(json!({ "token": "abc", "items": [{ "id": 1 }, { "id": 2 }] })),
+                ),
+                (
+                    "text".to_owned(),
+                    response(json!("{\"served\": \"as text\"}")),
+                ),
+            ]),
+            file: BTreeMap::from([(
+                "auth".to_owned(),
+                "Bearer {{login.response.body.$.token}}".to_owned(),
+            )]),
+            ..Variables::default()
+        };
+        let result = variables.substitute(
+            "{{auth}} {{login.response.headers.X-Token}} {{login.response.body.$.items[*].id}} \
+             {{text.response.body.$.served}} {{login.response.body.$.missing}} {{other.response.body.$}}",
+        );
+        assert_eq!(
+            result.text,
+            "Bearer abc header-token [1,2] as text {{login.response.body.$.missing}} \
+             {{other.response.body.$}}"
+        );
+        assert_eq!(
+            variables.lookup("text.response.body").as_deref(),
+            Some("{\"served\": \"as text\"}")
+        );
+        assert_eq!(
+            variables.lookup("login.response.body.*").as_deref(),
+            Some(r#"{"token":"abc","items":[{"id":1},{"id":2}]}"#)
+        );
     }
 
     #[test]

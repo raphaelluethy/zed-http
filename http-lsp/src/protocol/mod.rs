@@ -1,6 +1,7 @@
 //! Protocol dispatch. Each protocol module exposes `send(&PreparedRequest, &Context)` and
 //! returns a [`Response`]; the runner handles variables, scripts and the report around it.
 
+pub mod graphql;
 pub mod http;
 
 use std::{

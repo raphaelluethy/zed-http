@@ -69,6 +69,10 @@ impl Session {
     pub fn response(&self, name: &str) -> Option<Arc<NamedResponse>> {
         lock(&self.responses).get(name).cloned()
     }
+
+    pub fn responses(&self) -> HashMap<String, Arc<NamedResponse>> {
+        lock(&self.responses).clone()
+    }
 }
 
 /// The guarded maps stay consistent even if a holder panicked, so poisoning is ignored.

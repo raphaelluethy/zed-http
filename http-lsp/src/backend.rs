@@ -21,7 +21,7 @@ use crate::{
     report::{OutputView, Report, RunSummary},
     runner::Runner,
     session::Session,
-    syntax::{self, RequestBlock},
+    syntax,
 };
 
 const CMD_SEND: &str = "zed-http.send";
@@ -33,7 +33,8 @@ const ALL_COMMANDS: &[&str] = &[CMD_SEND, CMD_SEND_ALL, CMD_SAVE];
 #[derive(Clone)]
 struct OpenDocument {
     text: String,
-    requests: Option<Vec<RequestBlock>>,
+    /// Lines of requests and `run` commands, which get the Send lenses.
+    requests: Option<Vec<u32>>,
 }
 
 #[derive(Clone)]
@@ -83,7 +84,7 @@ impl Backend {
         );
     }
 
-    async fn request_blocks(&self, uri: &Url) -> Option<Vec<RequestBlock>> {
+    async fn request_lines(&self, uri: &Url) -> Option<Vec<u32>> {
         let (text, cached) = self
             .documents
             .read()
@@ -99,7 +100,13 @@ impl Backend {
                 .log_message(MessageType::WARNING, format!("zed-http: {error}"))
                 .await;
         }
-        let requests = document.blocks;
+        let mut requests: Vec<u32> = document
+            .blocks
+            .iter()
+            .map(|block| block.start_line)
+            .chain(document.runs.iter().map(|run| run.line))
+            .collect();
+        requests.sort_unstable();
 
         let mut documents = self.documents.write().await;
         if let Some(open_document) = documents.get_mut(uri) {
@@ -203,14 +210,13 @@ impl LanguageServer for Backend {
 
     async fn code_lens(&self, params: CodeLensParams) -> LspResult<Option<Vec<CodeLens>>> {
         let uri = params.text_document.uri;
-        let Some(requests) = self.request_blocks(&uri).await else {
+        let Some(requests) = self.request_lines(&uri).await else {
             return Ok(None);
         };
         let cache = self.cache.read().await;
         let mut lenses = Vec::with_capacity(requests.len() * 4 + 1);
 
-        for (index, request) in requests.iter().enumerate() {
-            let line = request.start_line;
+        for (index, &line) in requests.iter().enumerate() {
             let range = line_range(line);
             if index == 0 {
                 lenses.push(lens(range, "▶ Send All", CMD_SEND_ALL, &uri, line));

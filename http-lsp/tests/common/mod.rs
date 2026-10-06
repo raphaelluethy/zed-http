@@ -11,6 +11,7 @@ use std::{
 
 use axum::{
     body::Bytes,
+    extract::Multipart,
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Redirect},
     routing::{any, get},
@@ -30,6 +31,27 @@ pub async fn start_server() -> SocketAddr {
             get(|| async { Json(json!({ "hello": "world", "items": [1, 2] })) }),
         )
         .route("/echo", any(echo))
+        .route("/multipart", any(multipart))
+        .route(
+            "/graphql",
+            any(|Json(request): Json<Value>| async move { Json(json!({ "data": request })) }),
+        )
+        .route(
+            "/login",
+            get(|| async {
+                (
+                    [(header::SET_COOKIE, "login=yes; Path=/")],
+                    Redirect::to("/cookie"),
+                )
+            }),
+        )
+        .route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                "slow"
+            }),
+        )
         .route("/redirect", get(|| async { Redirect::to("/json") }))
         .route(
             "/set-cookie",
@@ -83,6 +105,19 @@ async fn echo(method: axum::http::Method, headers: HeaderMap, body: Bytes) -> im
         "contentType": header("content-type"),
         "body": String::from_utf8_lossy(&body),
     }))
+}
+
+async fn multipart(mut multipart: Multipart) -> impl IntoResponse {
+    let mut fields = Vec::new();
+    while let Some(field) = multipart.next_field().await.unwrap() {
+        fields.push(json!({
+            "name": field.name(),
+            "fileName": field.file_name(),
+            "contentType": field.content_type(),
+            "text": field.text().await.unwrap(),
+        }));
+    }
+    Json(Value::Array(fields))
 }
 
 /// A temporary directory holding a `.http` file and an env file pointing at `address`.

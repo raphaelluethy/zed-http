@@ -1,6 +1,7 @@
 //! Parses and executes IntelliJ-style `.http` files for the zed-http language server.
 
 pub mod backend;
+pub mod body;
 pub mod protocol;
 pub mod report;
 pub mod runner;

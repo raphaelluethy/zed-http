@@ -61,6 +61,8 @@ pub struct Execution {
     pub raw_body: String,
     pub error: Option<String>,
     pub warnings: Vec<String>,
+    /// Informational lines, such as where a response redirect saved the body.
+    pub notes: Vec<String>,
     pub script_console: Vec<ScriptConsoleEntry>,
     pub block_name: String,
 }
@@ -84,6 +86,9 @@ impl Execution {
         }
         for warning in &self.warnings {
             let _ = writeln!(output, "# warning: {warning}");
+        }
+        for note in &self.notes {
+            let _ = writeln!(output, "# {note}");
         }
         for entry in &self.script_console {
             entry.render_into(output);
