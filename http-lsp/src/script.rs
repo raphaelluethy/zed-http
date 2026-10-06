@@ -34,7 +34,7 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
     sync::Semaphore,
-    time::timeout,
+    time::{timeout_at, Instant},
 };
 
 use crate::{session::GlobalChange, variables::dynamic_variable};
@@ -132,16 +132,27 @@ impl ScriptEffects {
 
 pub struct ScriptEngine {
     limits: Limits,
-    worker: PathBuf,
+    /// The worker executable, or why it could not be located.
+    worker: Result<PathBuf, String>,
     worker_args: Vec<OsString>,
     workers: Arc<Semaphore>,
 }
 
 impl Default for ScriptEngine {
-    /// Uses the running executable as the worker.
+    /// Uses the running executable as the worker, resolved once to its real path so a symlinked
+    /// install keeps working. It is never looked up on `PATH`.
     fn default() -> Self {
-        let worker = env::current_exe().unwrap_or_else(|_| PathBuf::from("zed-http-lsp"));
-        Self::new(Limits::default(), worker)
+        let worker = env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .map_err(|error| {
+                format!("cannot locate the zed-http-lsp executable to run scripts: {error}")
+            });
+        Self {
+            limits: Limits::default(),
+            worker,
+            worker_args: vec![OsString::from(WORKER_FLAG)],
+            workers: Arc::new(Semaphore::new(MAX_CONCURRENT_SCRIPTS)),
+        }
     }
 }
 
@@ -164,7 +175,7 @@ impl ScriptEngine {
     pub fn with_command(limits: Limits, program: PathBuf, args: Vec<OsString>) -> Self {
         Self {
             limits,
-            worker: program,
+            worker: Ok(program),
             worker_args: args,
             workers: Arc::new(Semaphore::new(MAX_CONCURRENT_SCRIPTS)),
         }
@@ -191,19 +202,20 @@ impl ScriptEngine {
         let Ok(_permit) = self.workers.acquire().await else {
             return ScriptEffects::failed("script workers are shut down");
         };
-        // Dropping the future on timeout drops the child, which kills it.
-        match timeout(self.limits.wall_clock, self.run_worker(request)).await {
-            Ok(Ok(effects)) => effects,
-            Ok(Err(error)) => ScriptEffects::failed(error),
-            Err(_) => ScriptEffects::failed(format!(
-                "script exceeded the {} second time limit and was stopped; its effects were discarded",
-                self.limits.wall_clock.as_secs_f64()
-            )),
+        let deadline = Instant::now() + self.limits.wall_clock;
+        match self.run_worker(request, deadline).await {
+            Ok(effects) => effects,
+            Err(error) => ScriptEffects::failed(error),
         }
     }
 
-    async fn run_worker(&self, request: Vec<u8>) -> Result<ScriptEffects, String> {
-        let mut child = Command::new(&self.worker)
+    async fn run_worker(
+        &self,
+        request: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<ScriptEffects, String> {
+        let worker = self.worker.as_ref().map_err(Clone::clone)?;
+        let mut child = Command::new(worker)
             .args(&self.worker_args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -217,7 +229,7 @@ impl ScriptEngine {
                     "failed to start the script worker {}: {error}. The adapter binary may have \
                      been replaced by an extension update; restart the zed-http-lsp language \
                      server",
-                    self.worker.display()
+                    worker.display()
                 )
             })?;
         let mut stdin = child
@@ -250,24 +262,43 @@ impl ScriptEngine {
             let _ = tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await;
             diagnostics
         });
-        let mut output = Vec::new();
-        let read = stdout
-            .take(MAX_EFFECTS_BYTES as u64 + 1)
-            .read_to_end(&mut output)
-            .await;
-        if read.is_err() || output.len() > MAX_EFFECTS_BYTES {
-            let _ = child.kill().await;
-            write.abort();
-            diagnostics.abort();
-            return Err(match read {
-                Err(error) => format!("failed to read script results: {error}"),
-                Ok(_) => "script results are larger than 16 MiB".to_owned(),
-            });
-        }
-        let status = child
-            .wait()
-            .await
-            .map_err(|error| format!("failed to wait for the script worker: {error}"))?;
+        let exchange = async {
+            let mut output = Vec::new();
+            match stdout
+                .take(MAX_EFFECTS_BYTES as u64 + 1)
+                .read_to_end(&mut output)
+                .await
+            {
+                Err(error) => return Err(format!("failed to read script results: {error}")),
+                Ok(_) if output.len() > MAX_EFFECTS_BYTES => {
+                    return Err("script results are larger than 16 MiB".to_owned())
+                }
+                Ok(_) => {}
+            }
+            let status = child
+                .wait()
+                .await
+                .map_err(|error| format!("failed to wait for the script worker: {error}"))?;
+            Ok((output, status))
+        };
+        let outcome = match timeout_at(deadline, exchange).await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(format!(
+                "script exceeded the {} second time limit and was stopped; its effects were \
+                 discarded",
+                self.limits.wall_clock.as_secs_f64()
+            )),
+        };
+        let (output, status) = match outcome {
+            Ok(result) => result,
+            Err(error) => {
+                // Kill and reap the worker before reporting, so no process outlives the run.
+                let _ = child.kill().await;
+                write.abort();
+                diagnostics.abort();
+                return Err(error);
+            }
+        };
         let _ = write.await;
         let diagnostics = diagnostics.await.unwrap_or_default();
 

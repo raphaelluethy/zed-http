@@ -111,8 +111,10 @@ GET {{baseUrl}}/json
 
 #[tokio::test]
 async fn kills_scripts_past_the_wall_clock_and_keeps_working() {
+    // Generous enough for the trivial script below on slow machines; the nested loops run for
+    // far longer than this.
     let engine = script_engine(Limits {
-        wall_clock: Duration::from_millis(500),
+        wall_clock: Duration::from_secs(5),
         ..Limits::default()
     });
     // The loop limit is per call frame, so only killing the worker stops this.
@@ -127,7 +129,7 @@ async fn kills_scripts_past_the_wall_clock_and_keeps_working() {
     for effects in [first, second] {
         assert!(effects.error.unwrap().contains("time limit"));
     }
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(15));
 
     // Both worker slots are free again.
     let effects = engine
