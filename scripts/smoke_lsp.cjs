@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict");
 const childProcess = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
@@ -123,6 +124,56 @@ class LspClient {
     }
 }
 
+// A minimal WebSocket echo endpoint (RFC 6455 text frames only), so the smoke test needs no
+// dependencies.
+function acceptWebSocket(request, socket) {
+    const accept = crypto
+        .createHash("sha1")
+        .update(`${request.headers["sec-websocket-key"]}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+        .digest("base64");
+    socket.write(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            + `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+    );
+    const frame = (opcode, payload) => {
+        const header = payload.length < 126
+            ? Buffer.from([0x80 | opcode, payload.length])
+            : Buffer.from([0x80 | opcode, 126, payload.length >> 8, payload.length & 0xff]);
+        return Buffer.concat([header, payload]);
+    };
+    let buffer = Buffer.alloc(0);
+    socket.on("data", (chunk) => {
+        buffer = Buffer.concat([buffer, chunk]);
+        while (buffer.length >= 2) {
+            const opcode = buffer[0] & 0x0f;
+            let length = buffer[1] & 0x7f;
+            let offset = 2;
+            if (length === 126) {
+                if (buffer.length < 4) return;
+                length = buffer.readUInt16BE(2);
+                offset = 4;
+            } else if (length === 127) {
+                socket.destroy();
+                return;
+            }
+            const masked = (buffer[1] & 0x80) !== 0;
+            const end = offset + (masked ? 4 : 0) + length;
+            if (buffer.length < end) return;
+            const mask = masked ? buffer.subarray(offset, offset + 4) : Buffer.alloc(4);
+            const payload = Buffer.from(buffer.subarray(end - length, end));
+            for (let index = 0; index < payload.length; index += 1) payload[index] ^= mask[index % 4];
+            buffer = buffer.subarray(end);
+            if (opcode === 0x1) {
+                socket.write(frame(0x1, Buffer.from(`echo: ${payload.toString("utf8")}`)));
+            } else if (opcode === 0x8) {
+                socket.end(frame(0x8, payload.subarray(0, 2)));
+                return;
+            }
+        }
+    });
+    socket.on("error", () => {});
+}
+
 function responseFromLens(lenses, sourceLine, title) {
     const lens = lenses.find(
         (candidate) =>
@@ -159,6 +210,11 @@ async function main() {
         response.end(JSON.stringify({ authorized }));
     });
 
+    server.on("upgrade", (request, socket) => {
+        seen.push({ url: request.url, authorization: request.headers.authorization });
+        acceptWebSocket(request, socket);
+    });
+
     let client;
     try {
         await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -184,6 +240,13 @@ async function main() {
             "",
             '{ "token": "{{smokeToken}}" }',
             "",
+            "### WebSocket",
+            "# @timeout 300ms",
+            "WEBSOCKET {{wsUrl}}/socket",
+            "",
+            "===",
+            "hello {{smokeToken}}",
+            "",
         ].join("\n");
         fs.writeFileSync(requestPath, source);
         fs.writeFileSync(
@@ -192,6 +255,7 @@ async function main() {
                 smoke: {
                     baseUrl: `http://127.0.0.1:${port}`,
                     smokeToken: "native-runner-token",
+                    wsUrl: `ws://127.0.0.1:${port}`,
                 },
             }, null, 2)}\n`,
         );
@@ -215,7 +279,7 @@ async function main() {
             textDocument: { uri },
         });
         const sendLenses = lenses.filter((lens) => lens.command?.command === "zed-http.send");
-        assert.equal(sendLenses.length, 3, JSON.stringify(lenses));
+        assert.equal(sendLenses.length, 4, JSON.stringify(lenses));
 
         await client.execute(sendLenses[0].command);
         const loginLenses = await client.request("textDocument/codeLens", { textDocument: { uri } });
@@ -250,6 +314,18 @@ async function main() {
         assert.match(graphqlResponse, /"operationName": "Smoke"/);
         assert.match(graphqlResponse, /"token": "native-runner-token"/);
         assert.equal(seen.length, 3);
+
+        await client.execute(sendLenses[3].command);
+        const websocketLenses = await client.request("textDocument/codeLens", { textDocument: { uri } });
+        const websocketResponse = responseFromLens(
+            websocketLenses,
+            sendLenses[3].range.start.line,
+            "👁 Show",
+        );
+        assert.match(websocketResponse, /^→ hello native-runner-token$/m);
+        assert.match(websocketResponse, /^← echo: hello native-runner-token$/m);
+        assert.equal(seen.length, 4);
+        assert.equal(seen[3].url, "/socket");
 
         await client.stop();
         client = undefined;

@@ -50,8 +50,19 @@ Inside the adapter:
   - named-response references such as `{{login.response.body.$.token}}` and `{{login.response.headers.X-Token}}`
 - Pre-request scripts (`< {% %}` or `< file.js`) and response handlers (`> {% %}` or `> file.js`) with the IntelliJ `client`, `request` and `response` objects, plus `jsonPath`, `crypto` digests and `$random`
 - Response redirects (`>> file` and `>>! file`), `import` and `run`
-- GraphQL, WebSocket and gRPC requests
 - `client.global` values and cookies shared by all requests while the adapter runs
+
+### GraphQL
+
+`GRAPHQL url` sends the body as a JSON `POST`. An optional JSON variables object can follow the query. `operationName` comes from the first named operation; fragment definitions are skipped.
+
+### WebSocket
+
+`WEBSOCKET ws://…` (or `wss://`) opens a connection with the request headers on the handshake. The body is split into messages on `===` lines, and `=== wait-for-server` waits for one server message before the next is sent. After the last message, server messages are collected until the connection has been idle for 2 seconds, with a 30 second overall cap. `@timeout` overrides the idle time and raises the cap. The exchange renders as `→` / `←` lines.
+
+### gRPC
+
+`GRPC host:port/package.Service/Method` sends the JSON body as the request message; `grpcs://` or `https://` uses TLS, otherwise plaintext. Request headers become call metadata (`-bin` headers take base64 values). Method descriptors come from server reflection (v1, then v1alpha); without reflection, `.proto` files from the request file's directory up to the workspace root are compiled with protox. Unary and server-streaming methods are supported. Each response message renders as pretty JSON, followed by the gRPC status.
 
 ### Known gaps compared to IntelliJ
 
@@ -59,7 +70,9 @@ Inside the adapter:
 - There is no request history. `@no-log` only keeps the response body out of response buffers.
 - Scripts have no `require`, timers, file system or network access, and cannot read environment variables. They run with a 10 second time limit.
 - OAuth 2.0 (`$auth.token`), client certificates and proxy settings from env files, HTTP/3 and the IntelliJ example server are not supported.
-- GraphQL `operationName` is taken from the first named operation in the query.
+- GraphQL `operationName` is taken from the first named operation in the query and cannot be chosen explicitly.
+- gRPC client-streaming and bidirectional-streaming methods are not supported, and descriptors (reflection or `.proto` compilation) are resolved again for every request.
+- The cookie jar, `@no-cookie-jar` and `@no-redirect` apply to HTTP and GraphQL only: WebSocket handshakes and gRPC calls neither send nor store session cookies. `@no-log` applies to every protocol.
 
 ## Installation and use
 
