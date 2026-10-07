@@ -1,0 +1,4 @@
+[alias]
+# Builds what a dev install of the extension needs: its gutter task runs
+# target/debug/zed-http-lsp. The toolchain and wasm target come from rust-toolchain.toml.
+setup = "build --locked --package zed-http-lsp"

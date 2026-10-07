@@ -1,5 +1,14 @@
 [
   {
+    "label": "zed-http: Set up development",
+    "command": "command -v rustup >/dev/null || { echo 'zed-http: install rustup from https://rustup.rs first' >&2; exit 1; }; rustup toolchain install && cargo setup",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "shell": {
+      "program": "/bin/sh"
+    }
+  },
+  {
     "label": "HTTP: Send request",
     "command": "cargo run --locked --package zed-http-lsp -- --run \"$HTTP_REQUEST_FILE\" --line \"$HTTP_REQUEST_ROW\"",
     "cwd": "$ZED_WORKTREE_ROOT",

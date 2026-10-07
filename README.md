@@ -79,7 +79,7 @@ Inside the binary:
 
 ## Installation and use
 
-Install a development checkout with **zed: install dev extension** and select this repository. When an HTTP file is first opened, the extension downloads this project's platform archive, which contains only `zed-http-lsp`. If the archive cannot be downloaded, for example while offline, the extension reuses a previously downloaded binary.
+To install a development checkout, first set it up once: run **task: spawn → zed-http: Set up development** in this project, or `rustup toolchain install && cargo setup` in a terminal. This installs the pinned Rust toolchain with the `wasm32-wasip2` target that Zed compiles the extension with, and builds `target/debug/zed-http-lsp`, which the gutter task of a dev install runs. Zed requires Rust to be installed through [rustup](https://rustup.rs) for dev extensions. Then run **zed: install dev extension** and select this repository. When an HTTP file is first opened, the extension downloads this project's platform archive, which contains only `zed-http-lsp`. If the archive cannot be downloaded, for example while offline, the extension reuses a previously downloaded binary.
 
 Click the run arrow in the gutter next to a request to send it. Zed saves the file, and the response appears in the terminal panel with its status, timing, headers, body and test results. **HTTP: Send all requests** is available through **task: spawn**. Runs share one session per workspace: a token a login handler stores with `client.global.set` is available to the next request you run. On Windows, and whenever the language server is not running, a run starts with a fresh session.
 
@@ -134,7 +134,7 @@ On Windows, define the tasks in the project's `.zed/tasks.json` with `command` s
 
 ### Local build
 
-Build the binary:
+Build the binary (`cargo setup` is an alias for this):
 
 ```bash
 cargo build --package zed-http-lsp
