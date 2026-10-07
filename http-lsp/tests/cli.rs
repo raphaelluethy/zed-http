@@ -127,3 +127,103 @@ async fn packaged_task_finds_the_installed_dev_adapter_without_path_setup() {
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("200 OK"));
 }
+
+/// Starts the language server for `root` and waits until it has answered `initialize` and
+/// received `initialized`, after which it accepts forwarded task requests.
+#[cfg(unix)]
+async fn start_language_server(root: &std::path::Path) -> tokio::process::Child {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_zed-http-lsp"))
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let send = |message: serde_json::Value| {
+        let body = message.to_string();
+        format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes()
+    };
+    let root_uri = format!("file://{}", root.display());
+    stdin
+        .write_all(&send(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": { "processId": null, "rootUri": root_uri, "capabilities": {} }
+        })))
+        .await
+        .unwrap();
+    // Read the initialize response.
+    let mut length = 0;
+    loop {
+        let mut header = String::new();
+        stdout.read_line(&mut header).await.unwrap();
+        if let Some(value) = header.strip_prefix("Content-Length: ") {
+            length = value.trim().parse().unwrap();
+        }
+        if header == "\r\n" {
+            break;
+        }
+    }
+    let mut body = vec![0; length];
+    stdout.read_exact(&mut body).await.unwrap();
+    stdin
+        .write_all(&send(serde_json::json!({
+            "jsonrpc": "2.0", "method": "initialized", "params": {}
+        })))
+        .await
+        .unwrap();
+    // Keep the pipes open for the server's lifetime.
+    tokio::spawn(async move {
+        let _stdin = stdin;
+        let mut sink = Vec::new();
+        stdout.read_to_end(&mut sink).await.ok();
+    });
+    child
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn gutter_runs_share_the_language_servers_session_until_it_exits() {
+    let workspace = Workspace::new(start_server().await);
+    workspace.write(
+        "requests with spaces.http",
+        "### Login\nGET {{baseUrl}}/set-cookie\n> {% client.global.set(\"shared\", \"from-login\"); %}\n\n\
+         ### Use\nPOST {{baseUrl}}/echo\nX-Token: {{shared}}\n\n\
+         ### Cookie\nGET {{baseUrl}}/cookie\n",
+    );
+    let mut server = start_language_server(&workspace.root).await;
+
+    // The server binds its socket after `initialized`; retry until the run is forwarded.
+    let mut forwarded = false;
+    for _ in 0..50 {
+        let login = run(&workspace, &["--line", "2"]).await;
+        assert!(login.status.success(), "{login:?}");
+        if login.stderr.is_empty() {
+            forwarded = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        forwarded,
+        "the language server never accepted a forwarded run"
+    );
+
+    let used = run(&workspace, &["--line", "6"]).await;
+    let output = String::from_utf8_lossy(&used.stdout);
+    assert!(used.status.success(), "{used:?}");
+    assert!(output.contains("\"token\": \"from-login\""), "{output}");
+
+    let cookie = run(&workspace, &["--line", "10"]).await;
+    assert!(String::from_utf8_lossy(&cookie.stdout).contains("session=abc"));
+
+    // Like a session cookie, everything is gone once the language server exits.
+    server.kill().await.unwrap();
+    server.wait().await.unwrap();
+    let fresh = run(&workspace, &["--line", "10"]).await;
+    assert!(String::from_utf8_lossy(&fresh.stdout).contains("none"));
+    assert!(String::from_utf8_lossy(&fresh.stderr).contains("not running"));
+}

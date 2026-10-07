@@ -2,19 +2,14 @@ use std::{env, fs, path::Path};
 
 use zed_extension_api::{self as zed, settings::LspSettings, LanguageServerInstallationStatus};
 
-const KULALA_SERVER_ID: &str = "kulala-ls";
-const KULALA_PACKAGE_NAME: &str = "@mistweaverco/kulala-ls";
-const KULALA_PACKAGE_VERSION: &str = "1.11.1";
-const KULALA_SERVER_PATH: &str = "node_modules/@mistweaverco/kulala-ls/cli.cjs";
-
-const EXECUTION_SERVER_ID: &str = "zed-http-lsp";
-const EXECUTION_SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+const SERVER_ID: &str = "zed-http-lsp";
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 const RELEASE_REPOSITORY: &str = "raphaelluethy/zed-http";
 /// Marks the directory a download is extracted into before it is renamed into place.
 const STAGING: &str = "staging";
 
 struct HttpExtension {
-    cached_execution_server_path: Option<String>,
+    cached_server_path: Option<String>,
 }
 
 struct PlatformAsset {
@@ -26,67 +21,7 @@ struct PlatformAsset {
 }
 
 impl HttpExtension {
-    fn install_kulala_language_server(
-        &self,
-        language_server_id: &zed::LanguageServerId,
-    ) -> zed::Result<()> {
-        let installed_version = zed::npm_package_installed_version(KULALA_PACKAGE_NAME)?;
-
-        if installed_version.as_deref() != Some(KULALA_PACKAGE_VERSION) {
-            zed::set_language_server_installation_status(
-                language_server_id,
-                &LanguageServerInstallationStatus::Downloading,
-            );
-
-            if let Err(error) =
-                zed::npm_install_package(KULALA_PACKAGE_NAME, KULALA_PACKAGE_VERSION)
-            {
-                // An older installation is still usable, for example while offline.
-                if installed_version.is_some() && Path::new(KULALA_SERVER_PATH).is_file() {
-                    zed::set_language_server_installation_status(
-                        language_server_id,
-                        &LanguageServerInstallationStatus::None,
-                    );
-                    return Ok(());
-                }
-                let message = format!(
-                    "Failed to download {KULALA_PACKAGE_NAME} {KULALA_PACKAGE_VERSION}: {error}"
-                );
-                zed::set_language_server_installation_status(
-                    language_server_id,
-                    &LanguageServerInstallationStatus::Failed(message.clone()),
-                );
-                return Err(message);
-            }
-        }
-
-        zed::set_language_server_installation_status(
-            language_server_id,
-            &LanguageServerInstallationStatus::None,
-        );
-        Ok(())
-    }
-
-    fn kulala_command(
-        &self,
-        language_server_id: &zed::LanguageServerId,
-        worktree: &zed::Worktree,
-    ) -> zed::Result<zed::Command> {
-        self.install_kulala_language_server(language_server_id)?;
-        let server_path = env::current_dir()
-            .map_err(|error| format!("Failed to locate the extension directory: {error}"))?
-            .join(KULALA_SERVER_PATH)
-            .to_string_lossy()
-            .into_owned();
-
-        Ok(zed::Command {
-            command: zed::node_binary_path()?,
-            args: vec![server_path, "--stdio".to_owned()],
-            env: worktree.shell_env(),
-        })
-    }
-
-    fn execution_server_binary_path(
+    fn server_binary_path(
         &mut self,
         language_server_id: &zed::LanguageServerId,
         configured_path: Option<String>,
@@ -94,27 +29,27 @@ impl HttpExtension {
         if let Some(path) = configured_path.filter(|path| !path.is_empty()) {
             return Ok(path);
         }
-        let asset = execution_server_asset()?;
-        if let Some(path) = &self.cached_execution_server_path {
+        let asset = server_asset()?;
+        if let Some(path) = &self.cached_server_path {
             if is_installed(path) {
                 return Ok(path.clone());
             }
         }
 
-        let version_directory = install_directory(&asset.target, EXECUTION_SERVER_VERSION);
+        let version_directory = install_directory(&asset.target, SERVER_VERSION);
         let binary_path = format!("{version_directory}/{}", asset.binary_name);
         if !is_installed(&binary_path) {
-            match download_execution_server(language_server_id, &asset, &version_directory) {
-                Ok(()) => remove_old_execution_servers(&version_directory, &asset.target),
+            match download_server(language_server_id, &asset, &version_directory) {
+                Ok(()) => remove_old_servers(&version_directory, &asset.target),
                 Err(error) => {
-                    // Keep request execution working offline or when a release is not yet
-                    // published by falling back to a previously downloaded adapter.
-                    if let Some(previous) = previously_installed_execution_server(&asset) {
+                    // Keep working offline or when a release is not yet published by falling
+                    // back to a previously downloaded server.
+                    if let Some(previous) = previously_installed_server(&asset) {
                         zed::set_language_server_installation_status(
                             language_server_id,
                             &LanguageServerInstallationStatus::None,
                         );
-                        self.cached_execution_server_path = Some(previous.clone());
+                        self.cached_server_path = Some(previous.clone());
                         return Ok(previous);
                     }
                     zed::set_language_server_installation_status(
@@ -130,11 +65,11 @@ impl HttpExtension {
             language_server_id,
             &LanguageServerInstallationStatus::None,
         );
-        self.cached_execution_server_path = Some(binary_path.clone());
+        self.cached_server_path = Some(binary_path.clone());
         Ok(binary_path)
     }
 
-    fn execution_server_command(
+    fn server_command(
         &mut self,
         language_server_id: &zed::LanguageServerId,
         worktree: &zed::Worktree,
@@ -149,7 +84,7 @@ impl HttpExtension {
             .as_ref()
             .and_then(|settings| settings.arguments.clone())
             .unwrap_or_default();
-        let command = self.execution_server_binary_path(language_server_id, configured_path)?;
+        let command = self.server_binary_path(language_server_id, configured_path)?;
 
         let mut command_env = worktree.shell_env();
         if let Some(overrides) = binary_settings.and_then(|settings| settings.env) {
@@ -169,7 +104,7 @@ impl HttpExtension {
 impl zed::Extension for HttpExtension {
     fn new() -> Self {
         Self {
-            cached_execution_server_path: None,
+            cached_server_path: None,
         }
     }
 
@@ -179,22 +114,21 @@ impl zed::Extension for HttpExtension {
         worktree: &zed::Worktree,
     ) -> zed::Result<zed::Command> {
         match language_server_id.as_ref() {
-            KULALA_SERVER_ID => self.kulala_command(language_server_id, worktree),
-            EXECUTION_SERVER_ID => self.execution_server_command(language_server_id, worktree),
+            SERVER_ID => {
+                remove_kulala_install();
+                self.server_command(language_server_id, worktree)
+            }
             other => Err(format!("unknown HTTP language server {other}")),
         }
     }
 }
 
-fn execution_server_asset() -> zed::Result<PlatformAsset> {
+fn server_asset() -> zed::Result<PlatformAsset> {
     let (os, architecture) = zed::current_platform();
-    execution_server_asset_for(os, architecture)
+    server_asset_for(os, architecture)
 }
 
-fn execution_server_asset_for(
-    os: zed::Os,
-    architecture: zed::Architecture,
-) -> zed::Result<PlatformAsset> {
+fn server_asset_for(os: zed::Os, architecture: zed::Architecture) -> zed::Result<PlatformAsset> {
     let target = match (os, architecture) {
         (zed::Os::Mac, zed::Architecture::Aarch64) => "aarch64-apple-darwin",
         (zed::Os::Mac, zed::Architecture::X8664) => "x86_64-apple-darwin",
@@ -204,7 +138,7 @@ fn execution_server_asset_for(
         (zed::Os::Windows, zed::Architecture::Aarch64) => "aarch64-pc-windows-msvc",
         (os, architecture) => {
             return Err(format!(
-                "{EXECUTION_SERVER_ID} does not publish a binary for {os:?}/{architecture:?}"
+                "{SERVER_ID} does not publish a binary for {os:?}/{architecture:?}"
             ))
         }
     };
@@ -213,13 +147,13 @@ fn execution_server_asset_for(
     Ok(PlatformAsset {
         target: target.to_owned(),
         archive_name: format!(
-            "{EXECUTION_SERVER_ID}-{target}.{}",
+            "{SERVER_ID}-{target}.{}",
             if is_windows { "zip" } else { "tar.gz" }
         ),
         binary_name: if is_windows {
-            format!("{EXECUTION_SERVER_ID}.exe")
+            format!("{SERVER_ID}.exe")
         } else {
-            EXECUTION_SERVER_ID.to_owned()
+            SERVER_ID.to_owned()
         },
         file_type: if is_windows {
             zed::DownloadedFileType::Zip
@@ -230,22 +164,21 @@ fn execution_server_asset_for(
     })
 }
 
-fn download_execution_server(
+fn download_server(
     language_server_id: &zed::LanguageServerId,
     asset: &PlatformAsset,
     version_directory: &str,
 ) -> zed::Result<()> {
     let unavailable = |reason: String| {
         format!(
-            "sending requests is unavailable because {reason}. Completion and hover from Kulala LS \
-             still work. To use a local build of {EXECUTION_SERVER_ID}, set \
-             `lsp.{EXECUTION_SERVER_ID}.binary.path`."
+            "the HTTP language server is unavailable because {reason}. To use a local build of \
+             {SERVER_ID}, set `lsp.{SERVER_ID}.binary.path`."
         )
     };
-    let tag = format!("v{EXECUTION_SERVER_VERSION}");
+    let tag = format!("v{SERVER_VERSION}");
     let release = zed::github_release_by_tag_name(RELEASE_REPOSITORY, &tag).map_err(|error| {
         unavailable(format!(
-            "the {EXECUTION_SERVER_ID} {tag} release could not be found ({error})"
+            "the {SERVER_ID} {tag} release could not be found ({error})"
         ))
     })?;
     let archive = release
@@ -254,7 +187,7 @@ fn download_execution_server(
         .find(|candidate| candidate.name == asset.archive_name)
         .ok_or_else(|| {
             unavailable(format!(
-                "the {EXECUTION_SERVER_ID} {tag} release has no {} archive",
+                "the {SERVER_ID} {tag} release has no {} archive",
                 asset.archive_name
             ))
         })?;
@@ -265,7 +198,7 @@ fn download_execution_server(
     );
     // Extract into a staging directory and rename it into place only once the binary is
     // complete, so an interrupted download is never mistaken for an installation.
-    let staging = format!("{EXECUTION_SERVER_ID}-{STAGING}-{}", asset.target);
+    let staging = format!("{SERVER_ID}-{STAGING}-{}", asset.target);
     remove_path(&staging);
     zed::download_file(&archive.download_url, &staging, asset.file_type).map_err(|error| {
         remove_path(&staging);
@@ -301,13 +234,13 @@ fn is_installed(binary_path: &str) -> bool {
 /// Installs are kept per target triple, because Zed running natively and under Rosetta share
 /// the extension directory: `zed-http-lsp-<target>-<version>`.
 fn install_directory(target: &str, version: &str) -> String {
-    format!("{EXECUTION_SERVER_ID}-{target}-{version}")
+    format!("{SERVER_ID}-{target}-{version}")
 }
 
 /// Splits an install directory name into its target (absent for installs made before 0.0.4)
 /// and numeric version. Staging directories and other names yield `None`.
 fn parse_install(name: &str) -> Option<(Option<&str>, Vec<u64>)> {
-    let rest = name.strip_prefix(&format!("{EXECUTION_SERVER_ID}-"))?;
+    let rest = name.strip_prefix(&format!("{SERVER_ID}-"))?;
     if rest.starts_with(&format!("{STAGING}-")) {
         return None;
     }
@@ -322,7 +255,7 @@ fn parse_install(name: &str) -> Option<(Option<&str>, Vec<u64>)> {
     Some((target, version))
 }
 
-fn installed_execution_server_directories() -> Vec<String> {
+fn installed_server_directories() -> Vec<String> {
     let Ok(entries) = fs::read_dir(".") else {
         return Vec::new();
     };
@@ -332,8 +265,8 @@ fn installed_execution_server_directories() -> Vec<String> {
         .collect()
 }
 
-fn previously_installed_execution_server(asset: &PlatformAsset) -> Option<String> {
-    installed_execution_server_directories()
+fn previously_installed_server(asset: &PlatformAsset) -> Option<String> {
+    installed_server_directories()
         .into_iter()
         .filter_map(|directory| {
             let (target, version) = parse_install(&directory)?;
@@ -365,8 +298,8 @@ fn stale_installs(names: &[String], active: &str, target: &str) -> Vec<String> {
     previous.into_iter().map(|(_, name)| name.clone()).collect()
 }
 
-fn remove_old_execution_servers(active_version_directory: &str, target: &str) {
-    let names = installed_execution_server_directories();
+fn remove_old_servers(active_version_directory: &str, target: &str) {
+    let names = installed_server_directories();
     for name in stale_installs(&names, active_version_directory, target) {
         remove_path(&name);
     }
@@ -378,6 +311,15 @@ fn remove_path(name: &str) {
         fs::remove_dir_all(path).ok();
     } else if path.exists() {
         fs::remove_file(path).ok();
+    }
+}
+
+/// Earlier versions installed Kulala LS from npm into the extension's work directory.
+fn remove_kulala_install() {
+    if Path::new("node_modules/@mistweaverco").exists() {
+        for name in ["node_modules", "package.json", "package-lock.json"] {
+            remove_path(name);
+        }
     }
 }
 
@@ -398,13 +340,12 @@ mod tests {
 
     #[test]
     fn maps_supported_platforms_to_release_archives() {
-        let mac = execution_server_asset_for(zed::Os::Mac, zed::Architecture::Aarch64).unwrap();
+        let mac = server_asset_for(zed::Os::Mac, zed::Architecture::Aarch64).unwrap();
         assert_eq!(mac.archive_name, "zed-http-lsp-aarch64-apple-darwin.tar.gz");
         assert_eq!(mac.binary_name, "zed-http-lsp");
         assert!(mac.make_executable);
 
-        let windows =
-            execution_server_asset_for(zed::Os::Windows, zed::Architecture::X8664).unwrap();
+        let windows = server_asset_for(zed::Os::Windows, zed::Architecture::X8664).unwrap();
         assert_eq!(
             windows.archive_name,
             "zed-http-lsp-x86_64-pc-windows-msvc.zip"
@@ -412,8 +353,7 @@ mod tests {
         assert_eq!(windows.binary_name, "zed-http-lsp.exe");
         assert!(!windows.make_executable);
 
-        let windows_arm =
-            execution_server_asset_for(zed::Os::Windows, zed::Architecture::Aarch64).unwrap();
+        let windows_arm = server_asset_for(zed::Os::Windows, zed::Architecture::Aarch64).unwrap();
         assert_eq!(
             windows_arm.archive_name,
             "zed-http-lsp-aarch64-pc-windows-msvc.zip"
@@ -473,7 +413,7 @@ mod tests {
 
     #[test]
     fn release_manifests_share_the_extension_version() {
-        let version_line = format!("version = \"{EXECUTION_SERVER_VERSION}\"");
+        let version_line = format!("version = \"{SERVER_VERSION}\"");
         assert!(include_str!("../extension.toml").contains(&version_line));
         assert!(include_str!("../http-lsp/Cargo.toml").contains(&version_line));
         assert!(include_str!("../Cargo.toml").contains(&version_line));

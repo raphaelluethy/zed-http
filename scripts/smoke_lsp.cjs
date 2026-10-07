@@ -27,7 +27,8 @@ class LspClient {
         this.buffer = Buffer.alloc(0);
         this.nextId = 1;
         this.pending = new Map();
-        this.executionWaiter = undefined;
+        this.notifications = [];
+        this.waiters = [];
         this.stderr = "";
         this.child.stderr.setEncoding("utf8");
         this.child.stderr.on("data", (chunk) => (this.stderr += chunk));
@@ -48,7 +49,6 @@ class LspClient {
             pending.reject(error);
             this.pending.delete(id);
         }
-        this.settleExecution(error);
     }
 
     send(message) {
@@ -89,39 +89,32 @@ class LspClient {
         }
     }
 
-    // Send and Send All run in the background; the server refreshes code lenses on success and
-    // shows an error message on failure.
-    execute(command) {
-        const finished = new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                this.executionWaiter = undefined;
-                reject(new Error(`timed out waiting for ${command.command}\n${this.stderr}`));
-            }, 30_000);
-            this.executionWaiter = {
-                resolve: () => (clearTimeout(timer), resolve()),
-                reject: (error) => (clearTimeout(timer), reject(error)),
-            };
+    // Resolves with the first notification of `method` that satisfies `predicate`.
+    waitForNotification(method, predicate = () => true) {
+        const seen = this.notifications.find((message) => message.method === method && predicate(message.params));
+        if (seen) return Promise.resolve(seen.params);
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(
+                () => reject(new Error(`timed out waiting for ${method}\n${this.stderr}`)),
+                15_000,
+            );
+            this.waiters.push({ method, predicate, resolve: (params) => (clearTimeout(timer), resolve(params)) });
         });
-        return this.request("workspace/executeCommand", command).then(() => finished);
-    }
-
-    settleExecution(error) {
-        const waiter = this.executionWaiter;
-        this.executionWaiter = undefined;
-        if (!waiter) return;
-        if (error) waiter.reject(error);
-        else waiter.resolve();
     }
 
     handle(message) {
         if (message.method && message.id !== undefined) {
             this.send({ jsonrpc: "2.0", id: message.id, result: null });
-            if (message.method === "workspace/codeLens/refresh") this.settleExecution();
             return;
         }
 
-        if (message.method === "window/showMessage" && message.params?.type === 1) {
-            this.settleExecution(new Error(message.params.message));
+        if (message.method) {
+            this.notifications.push(message);
+            this.waiters = this.waiters.filter((waiter) => {
+                if (waiter.method !== message.method || !waiter.predicate(message.params)) return true;
+                waiter.resolve(message.params);
+                return false;
+            });
             return;
         }
 
@@ -212,17 +205,22 @@ function acceptWebSocket(request, socket) {
     socket.on("error", () => {});
 }
 
-function responseFromLens(lenses, sourceLine, title) {
-    const lens = lenses.find(
-        (candidate) =>
-            candidate.range.start.line === sourceLine
-            && candidate.command?.title === title
-            && candidate.command?.command === "editor.action.goToLocations",
-    );
-    assert.ok(lens, `missing ${title} response lens on line ${sourceLine}: ${JSON.stringify(lenses)}`);
-    const responseUri = lens.command.arguments?.[2]?.[0]?.uri;
-    assert.ok(responseUri, `missing response URI: ${JSON.stringify(lens)}`);
-    return fs.readFileSync(fileURLToPath(responseUri), "utf8");
+// Runs a gutter task the way Zed does: in the workspace root, with a one-based row. It must not
+// block, because the mock server answers from this process.
+function runTask(cwd, file, row) {
+    const args = ["--run", file];
+    if (row !== undefined) args.push("--line", String(row));
+    return new Promise((resolve, reject) => {
+        const child = childProcess.execFile(
+            lspPath,
+            args,
+            { cwd, env: { ...process.env, NO_COLOR: "1" }, encoding: "utf8", timeout: 30_000 },
+            (error, stdout, stderr) => {
+                if (error && typeof error.code !== "number") reject(error);
+                else resolve({ status: child.exitCode, stdout, stderr });
+            },
+        );
+    });
 }
 
 async function main() {
@@ -269,9 +267,12 @@ async function main() {
             "%}",
             "GET {{baseUrl}}/{{dynamicPath}}",
             "",
-            "### Verify the environment",
+            '> {% client.global.set("sessionToken", "native-runner-token"); %}',
+            "",
+            "### Verify the session",
             "GET {{baseUrl}}/verify",
-            "Authorization: Bearer {{smokeToken}}",
+            "Authorization: Bearer {{sessionToken}}",
+            "X-Env: {{smokeToken}}",
             "",
             "### GraphQL",
             "GRAPHQL {{baseUrl}}/graphql",
@@ -307,71 +308,85 @@ async function main() {
             env: { ...process.env, ZED_HTTP_ENV: "smoke" },
         });
         const uri = pathToFileURL(requestPath).href;
-        await client.request("initialize", {
+        const initialized = await client.request("initialize", {
             processId: process.pid,
-            capabilities: { window: { workDoneProgress: true } },
+            capabilities: {},
             rootUri: pathToFileURL(temporary).href,
         });
+        assert.ok(initialized.capabilities.completionProvider, JSON.stringify(initialized));
+        assert.ok(initialized.capabilities.hoverProvider, JSON.stringify(initialized));
+        assert.equal(initialized.capabilities.codeLensProvider, undefined);
         client.notify("initialized", {});
         client.notify("textDocument/didOpen", {
             textDocument: { uri, languageId: "http", version: 1, text: source },
         });
 
-        const lenses = await client.request("textDocument/codeLens", {
+        const diagnostics = await client.waitForNotification(
+            "textDocument/publishDiagnostics",
+            (params) => params.uri === uri,
+        );
+        assert.equal(diagnostics.diagnostics.length, 0, JSON.stringify(diagnostics));
+
+        // Completion inside `{{` offers env, script-set and dynamic variables.
+        const envLine = source.split("\n").findIndex((line) => line.startsWith("X-Env:"));
+        const completions = await client.request("textDocument/completion", {
             textDocument: { uri },
+            position: { line: envLine, character: "X-Env: {{".length },
         });
-        const sendLenses = lenses.filter((lens) => lens.command?.command === "zed-http.send");
-        assert.equal(sendLenses.length, 4, JSON.stringify(lenses));
+        const labels = completions.map((item) => item.label);
+        for (const expected of ["smokeToken", "baseUrl", "sessionToken", "$uuid"]) {
+            assert.ok(labels.includes(expected), `missing ${expected}: ${labels}`);
+        }
 
-        await client.execute(sendLenses[0].command);
-        const loginLenses = await client.request("textDocument/codeLens", { textDocument: { uri } });
-        const loginResponse = responseFromLens(
-            loginLenses,
-            sendLenses[0].range.start.line,
-            "👁 Show",
-        );
-        assert.match(loginResponse, /HTTP\/1\.1 200 OK/);
-        assert.match(loginResponse, /"prepared": true/);
+        const hoverAt = (prefix) => client.request("textDocument/hover", {
+            textDocument: { uri },
+            position: {
+                line: source.split("\n").findIndex((line) => line.startsWith(prefix)),
+                character: prefix.length + 3,
+            },
+        });
+        const envHover = await hoverAt("X-Env: ");
+        assert.match(envHover.contents.value, /environment `smoke`/);
+        assert.match(envHover.contents.value, /native-runner-token/);
+        assert.match((await hoverAt("Authorization: Bearer ")).contents.value, /set by a script/);
 
-        await client.execute(sendLenses[1].command);
-        const verifyLenses = await client.request("textDocument/codeLens", { textDocument: { uri } });
-        const verifyResponse = responseFromLens(
-            verifyLenses,
-            sendLenses[1].range.start.line,
-            "👁 Show",
-        );
-        assert.match(verifyResponse, /HTTP\/1\.1 200 OK/);
-        assert.match(verifyResponse, /"authorized": true/);
-        assert.equal(seen[0].url, "/prepared");
-        assert.equal(seen[1].authorization, "Bearer native-runner-token");
+        // Gutter tasks are forwarded to this server once it has bound its socket.
+        const lines = source.split("\n");
+        const row = (prefix) => lines.findIndex((line) => line.startsWith(prefix)) + 1;
+        let prepared;
+        for (let attempt = 0; attempt < 50; attempt += 1) {
+            prepared = await runTask(temporary, requestPath, row("GET {{baseUrl}}/{{dynamicPath}}"));
+            if (prepared.stderr === "") break;
+            await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+        assert.equal(prepared.status, 0, prepared.stderr);
+        assert.equal(prepared.stderr, "", "the run was not forwarded to the language server");
+        assert.match(prepared.stdout, /200 OK/);
+        assert.match(prepared.stdout, /"prepared": true/);
+        assert.equal(seen.at(-1).url, "/prepared");
 
-        await client.execute(sendLenses[2].command);
-        const graphqlLenses = await client.request("textDocument/codeLens", { textDocument: { uri } });
-        const graphqlResponse = responseFromLens(
-            graphqlLenses,
-            sendLenses[2].range.start.line,
-            "👁 Show",
-        );
-        assert.match(graphqlResponse, /^# GRAPHQL http:\/\/127\.0\.0\.1:\d+\/graphql$/m);
-        assert.match(graphqlResponse, /"operationName": "Smoke"/);
-        assert.match(graphqlResponse, /"token": "native-runner-token"/);
-        assert.equal(seen.length, 3);
+        // The token a handler stored in the previous run is used by this one.
+        const verified = await runTask(temporary, requestPath, row("GET {{baseUrl}}/verify"));
+        assert.equal(verified.status, 0, verified.stdout + verified.stderr);
+        assert.match(verified.stdout, /"authorized": true/);
+        assert.equal(seen.at(-1).authorization, "Bearer native-runner-token");
+        // Hover reads the same in-memory session.
+        assert.match((await hoverAt("Authorization: Bearer ")).contents.value, /client\.global/);
 
-        await client.execute(sendLenses[3].command);
-        const websocketLenses = await client.request("textDocument/codeLens", { textDocument: { uri } });
-        const websocketResponse = responseFromLens(
-            websocketLenses,
-            sendLenses[3].range.start.line,
-            "👁 Show",
-        );
-        assert.match(websocketResponse, /^→ hello native-runner-token$/m);
-        assert.match(websocketResponse, /^← echo: hello native-runner-token$/m);
-        assert.equal(seen.length, 4);
-        assert.equal(seen[3].url, "/socket");
+        const graphql = await runTask(temporary, requestPath, row("GRAPHQL"));
+        assert.equal(graphql.status, 0, graphql.stdout + graphql.stderr);
+        assert.match(graphql.stdout, /"operationName": "Smoke"/);
+        assert.match(graphql.stdout, /"token": "native-runner-token"/);
+
+        const websocket = await runTask(temporary, requestPath, row("WEBSOCKET"));
+        assert.equal(websocket.status, 0, websocket.stdout + websocket.stderr);
+        assert.match(websocket.stdout, /→ hello native-runner-token/);
+        assert.match(websocket.stdout, /← echo: hello native-runner-token/);
+        assert.equal(seen.at(-1).url, "/socket");
 
         await client.stop();
         client = undefined;
-        console.log("Native runner smoke test passed: code lenses execute unsaved requests in-process.");
+        console.log("Smoke test passed: completion, hover and diagnostics work, and gutter runs share the language server's session.");
     } finally {
         if (client) client.child.kill();
         for (const socket of sockets) socket.destroy();

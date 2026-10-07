@@ -178,6 +178,36 @@ pub fn parse(text: &str) -> Document {
     parser.finish()
 }
 
+/// Where a line sits in a request, judged from the lines above it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineContext {
+    /// Before the request line: comments, directives, variables, scripts and the request line.
+    Preamble,
+    /// After the request line, before the first blank line.
+    Headers,
+    /// The body and response handlers.
+    Body,
+    /// Inside a `{% %}` script.
+    Script,
+}
+
+/// Runs the parser over the lines before `line` and reports the state it is left in.
+pub fn line_context(text: &str, line: u32) -> LineContext {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut parser = Parser::default();
+    for (index, text) in text.lines().enumerate().take(line as usize) {
+        parser.line(index as u32, text);
+    }
+    if parser.script.is_some() {
+        return LineContext::Script;
+    }
+    match parser.state {
+        State::Preamble => LineContext::Preamble,
+        State::Url | State::Headers => LineContext::Headers,
+        State::Body | State::Handlers => LineContext::Body,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum State {
     #[default]
@@ -875,6 +905,18 @@ fn parse_parts(lines: &[String]) -> Vec<BodyPart> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reports_the_context_of_a_line() {
+        let text = "# @name login\n< {%\n  x();\n%}\nPOST https://example.test\nAccept: */*\n\n{}\n### Next\n";
+        assert_eq!(line_context(text, 0), LineContext::Preamble);
+        assert_eq!(line_context(text, 2), LineContext::Script);
+        assert_eq!(line_context(text, 4), LineContext::Preamble);
+        assert_eq!(line_context(text, 5), LineContext::Headers);
+        assert_eq!(line_context(text, 6), LineContext::Headers);
+        assert_eq!(line_context(text, 7), LineContext::Body);
+        assert_eq!(line_context(text, 9), LineContext::Preamble);
+    }
 
     fn text(body: &Body) -> &str {
         match body {

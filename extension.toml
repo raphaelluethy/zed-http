@@ -1,6 +1,6 @@
 id = "http"
 name = "HTTP"
-description = "HTTP file support with built-in request execution"
+description = "JetBrains-style .http files: completion, hover and requests in the terminal"
 version = "0.1.0"
 schema_version = 1
 authors = ["raphael@lty.gg"]
@@ -10,19 +10,11 @@ repository = "https://github.com/raphaelluethy/zed-http"
 repository = "https://github.com/rest-nvim/tree-sitter-http"
 rev = "e061995f0caf2fa30f68fa1fdf2c08bcbd4629a8"
 
-[language_servers.kulala-ls]
-name = "Kulala HTTP Language Server"
-languages = ["http"]
-
 [language_servers.zed-http-lsp]
-name = "HTTP Request Execution Adapter"
+name = "HTTP Language Server"
 languages = ["http"]
 
 [[capabilities]]
 kind = "download_file"
 host = "github.com"
 path = ["raphaelluethy", "zed-http", "**"]
-
-[[capabilities]]
-kind = "npm:install"
-package = "@mistweaverco/kulala-ls"

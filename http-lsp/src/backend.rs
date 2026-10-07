@@ -1,497 +1,293 @@
+//! The language server: completion, hover and parse diagnostics for `.http` files. It also runs
+//! the requests that gutter tasks forward to it (see `task.rs`), so they share its in-memory
+//! session for as long as Zed runs.
+
 use std::{
     collections::HashMap,
-    env,
+    env, fs,
     path::{Path, PathBuf},
-    process,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::Value;
-use tokio::{
-    io::AsyncWriteExt,
-    sync::{Mutex, RwLock},
-};
+use tokio::sync::{Mutex, RwLock};
 use tower_lsp::{jsonrpc::Result as LspResult, lsp_types::*, Client, LanguageServer};
 
 use crate::{
-    report::{OutputView, Report, RunSummary},
+    assist::{self, Known},
     runner::Runner,
     session::Session,
-    syntax,
+    syntax::{self, Document},
+    task::{self, TaskRequest},
+    variables::{load_environment, Environment, PRIVATE_ENV_FILE, PUBLIC_ENV_FILE},
 };
 
-const CMD_SEND: &str = "zed-http.send";
-const CMD_SEND_ALL: &str = "zed-http.sendAll";
-const CMD_SAVE: &str = "zed-http.save";
-const CMD_GO_TO_LOCATIONS: &str = "editor.action.goToLocations";
-const ALL_COMMANDS: &[&str] = &[CMD_SEND, CMD_SEND_ALL, CMD_SAVE];
-
+/// An open file, parsed once per change and shared by completion and hover.
 #[derive(Clone)]
 struct OpenDocument {
-    text: String,
-    /// Lines of requests and `run` commands, which get the Send lenses.
-    requests: Option<Vec<u32>>,
-}
-
-#[derive(Clone)]
-struct CachedResponse {
-    report: Arc<Report>,
-    full_uri: Url,
-    headers_uri: Url,
+    text: Arc<str>,
+    document: Arc<Document>,
 }
 
 #[derive(Clone)]
 pub struct Backend {
     client: Client,
+    session: Arc<Session>,
     runner: Arc<Runner>,
     documents: Arc<RwLock<HashMap<Url, OpenDocument>>>,
-    cache: Arc<RwLock<HashMap<(Url, u32), CachedResponse>>>,
-    execution_lock: Arc<Mutex<()>>,
-    response_directory: Arc<PathBuf>,
-    work_done_progress: Arc<AtomicBool>,
-    next_progress_id: Arc<AtomicU64>,
+    workspace_roots: Arc<RwLock<Vec<PathBuf>>>,
+    /// Loaded environments by request file directory. Only used while the client watches the
+    /// env files for us, because a change would otherwise go unnoticed.
+    environments: Arc<RwLock<HashMap<PathBuf, Environment>>>,
+    watching_env_files: Arc<AtomicBool>,
+    can_watch_files: Arc<AtomicBool>,
+    listeners: Arc<Mutex<Vec<task::Listener>>>,
 }
 
 impl Backend {
     pub fn new(client: Client) -> Self {
+        let session = Session::new();
         Self {
             client,
-            runner: Arc::new(Runner::new(Session::new())),
+            runner: Arc::new(Runner::new(Arc::clone(&session))),
+            session,
             documents: Arc::new(RwLock::new(HashMap::new())),
-            cache: Arc::new(RwLock::new(HashMap::new())),
-            execution_lock: Arc::new(Mutex::new(())),
-            response_directory: Arc::new(
-                env::temp_dir()
-                    .join("zed-http")
-                    .join(format!("responses-{}", process::id())),
-            ),
-            work_done_progress: Arc::new(AtomicBool::new(false)),
-            next_progress_id: Arc::new(AtomicU64::new(0)),
+            workspace_roots: Arc::new(RwLock::new(Vec::new())),
+            environments: Arc::new(RwLock::new(HashMap::new())),
+            watching_env_files: Arc::new(AtomicBool::new(false)),
+            can_watch_files: Arc::new(AtomicBool::new(false)),
+            listeners: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    async fn store_document(&self, uri: Url, text: String) {
-        self.documents.write().await.insert(
-            uri,
-            OpenDocument {
-                text,
-                requests: None,
-            },
-        );
-    }
-
-    async fn request_lines(&self, uri: &Url) -> Option<Vec<u32>> {
-        let (text, cached) = self
-            .documents
-            .read()
-            .await
-            .get(uri)
-            .map(|document| (document.text.clone(), document.requests.clone()))?;
-        if let Some(requests) = cached {
-            return Some(requests);
-        }
-        let document = syntax::parse(&text);
-        if let Some(error) = document.error_summary() {
-            self.client
-                .log_message(MessageType::WARNING, format!("zed-http: {error}"))
-                .await;
-        }
-        let mut requests: Vec<u32> = document
-            .blocks
-            .iter()
-            .map(|block| block.start_line)
-            .chain(document.runs.iter().map(|run| run.line))
-            .collect();
-        requests.sort_unstable();
-
-        let mut documents = self.documents.write().await;
-        if let Some(open_document) = documents.get_mut(uri) {
-            if open_document.text == text {
-                open_document.requests = Some(requests.clone());
+    /// Accepts forwarded gutter-task requests for each workspace root. Runs are independent
+    /// tasks, so a slow request never holds up another; the session is safe to share.
+    async fn listen_for_tasks(&self) {
+        let roots = self.workspace_roots.read().await.clone();
+        let mut listeners = self.listeners.lock().await;
+        for root in roots {
+            let runner = Arc::clone(&self.runner);
+            let run = move |mut request: TaskRequest| {
+                let runner = Arc::clone(&runner);
+                async move {
+                    if request.environment.is_none() {
+                        request.environment = env::var("ZED_HTTP_ENV").ok();
+                    }
+                    task::execute(&runner, &request).await
+                }
+            };
+            match task::listen(&root, run) {
+                Ok(Some(listener)) => listeners.push(listener),
+                Ok(None) => {}
+                Err(error) => {
+                    self.client
+                        .log_message(
+                            MessageType::WARNING,
+                            format!("zed-http: gutter tasks will not share this session: {error}"),
+                        )
+                        .await;
+                }
             }
         }
-        Some(requests)
     }
 
-    async fn remove_cached_document(&self, uri: &Url) {
-        self.cache
-            .write()
+    /// Asks the client to report env file changes, which lets environments be cached.
+    async fn watch_env_files(&self) {
+        if !self.can_watch_files.load(Ordering::Relaxed) {
+            return;
+        }
+        let watchers = [PUBLIC_ENV_FILE, PRIVATE_ENV_FILE]
+            .map(|name| FileSystemWatcher {
+                glob_pattern: GlobPattern::String(format!("**/{name}")),
+                kind: None,
+            })
+            .to_vec();
+        let registration = Registration {
+            id: "zed-http-env-files".to_owned(),
+            method: "workspace/didChangeWatchedFiles".to_owned(),
+            register_options: serde_json::to_value(DidChangeWatchedFilesRegistrationOptions {
+                watchers,
+            })
+            .ok(),
+        };
+        if self
+            .client
+            .register_capability(vec![registration])
             .await
-            .retain(|(cached_uri, _), _| cached_uri != uri);
+            .is_ok()
+        {
+            self.watching_env_files.store(true, Ordering::Relaxed);
+        }
     }
 
-    async fn show_error(&self, message: impl Into<String>) {
+    async fn document(&self, uri: &Url) -> Option<OpenDocument> {
+        self.documents.read().await.get(uri).cloned()
+    }
+
+    async fn update(&self, uri: Url, text: String, version: Option<i32>) {
+        let document = syntax::parse(&text);
+        let diagnostics = assist::diagnostics(&document, &text);
+        self.documents.write().await.insert(
+            uri.clone(),
+            OpenDocument {
+                text: text.into(),
+                document: Arc::new(document),
+            },
+        );
         self.client
-            .show_message(MessageType::ERROR, format!("zed-http: {}", message.into()))
+            .publish_diagnostics(uri, diagnostics, version)
             .await;
     }
 
-    async fn cached_response(&self, uri: &Url, line: u32) -> Option<CachedResponse> {
-        let cached = self.cache.read().await.get(&(uri.clone(), line)).cloned();
-        if cached.is_none() {
-            self.client
-                .show_message(
-                    MessageType::WARNING,
-                    "zed-http: no response is cached for this request; send it first",
-                )
-                .await;
+    /// The environment and session a gutter run of this file would use.
+    async fn known(&self, uri: &Url) -> Known {
+        let environment = match uri.to_file_path() {
+            Ok(path) => self.environment(&path).await,
+            Err(()) => Environment::default(),
+        };
+        Known {
+            environment_name: environment.name,
+            environment: environment.variables,
+            globals: self.session.globals(),
+            responses: self.session.responses(),
         }
-        cached
+    }
+
+    async fn environment(&self, path: &Path) -> Environment {
+        let directory = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let cache = self.watching_env_files.load(Ordering::Relaxed);
+        if cache {
+            if let Some(environment) = self.environments.read().await.get(&directory) {
+                return environment.clone();
+            }
+        }
+        let roots = self.workspace_roots.read().await.clone();
+        let path = path.to_path_buf();
+        // Env files are read with blocking I/O, which must stay off the async workers.
+        let loaded = tokio::task::spawn_blocking(move || {
+            load_environment(&path, &roots, env::var("ZED_HTTP_ENV").ok().as_deref())
+        })
+        .await
+        .unwrap_or_else(|error| Err(error.to_string()));
+        let environment = match loaded {
+            Ok(environment) => environment,
+            Err(error) => {
+                self.client
+                    .log_message(MessageType::WARNING, format!("zed-http: {error}"))
+                    .await;
+                Environment::default()
+            }
+        };
+        if cache {
+            self.environments
+                .write()
+                .await
+                .insert(directory, environment.clone());
+        }
+        environment
     }
 }
 
 #[tower_lsp::async_trait]
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> LspResult<InitializeResult> {
-        self.runner.set_workspace_roots(workspace_roots(&params));
-        let work_done_progress = params
+        let roots = workspace_roots(&params);
+        let can_watch = params
             .capabilities
-            .window
-            .and_then(|window| window.work_done_progress)
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.did_change_watched_files)
+            .and_then(|watched| watched.dynamic_registration)
             .unwrap_or(false);
-        self.work_done_progress
-            .store(work_done_progress, Ordering::Relaxed);
+        self.can_watch_files.store(can_watch, Ordering::Relaxed);
+        self.runner.set_workspace_roots(roots.clone());
+        *self.workspace_roots.write().await = roots;
         Ok(InitializeResult {
-            server_info: Some(ServerInfo {
-                name: "zed-http execution adapter".to_owned(),
-                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
-            }),
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
-                code_lens_provider: Some(CodeLensOptions {
-                    resolve_provider: Some(false),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(["{", "$", "@", ".", ":"].map(str::to_owned).to_vec()),
+                    ..CompletionOptions::default()
                 }),
-                execute_command_provider: Some(ExecuteCommandOptions {
-                    commands: ALL_COMMANDS
-                        .iter()
-                        .map(|command| (*command).to_owned())
-                        .collect(),
-                    work_done_progress_options: Default::default(),
-                }),
-                ..Default::default()
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                ..ServerCapabilities::default()
             },
+            server_info: Some(ServerInfo {
+                name: "zed-http-lsp".to_owned(),
+                version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+            }),
         })
     }
 
-    async fn initialized(&self, _params: InitializedParams) {
-        self.client
-            .log_message(MessageType::INFO, "zed-http execution adapter ready")
-            .await;
+    async fn initialized(&self, _: InitializedParams) {
+        self.listen_for_tasks().await;
+        self.watch_env_files().await;
+    }
+
+    async fn did_change_watched_files(&self, _: DidChangeWatchedFilesParams) {
+        self.environments.write().await.clear();
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let uri = params.text_document.uri;
-        self.remove_cached_document(&uri).await;
-        self.store_document(uri, params.text_document.text).await;
+        let document = params.text_document;
+        self.update(document.uri, document.text, Some(document.version))
+            .await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let Some(text) = full_document_text(&params.content_changes) else {
-            return;
-        };
-        let uri = params.text_document.uri;
-        self.remove_cached_document(&uri).await;
-        self.store_document(uri, text.to_owned()).await;
+        if let Some(text) = full_document_text(&params.content_changes) {
+            self.update(
+                params.text_document.uri,
+                text.to_owned(),
+                Some(params.text_document.version),
+            )
+            .await;
+        }
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.documents
-            .write()
-            .await
-            .remove(&params.text_document.uri);
-        self.remove_cached_document(&params.text_document.uri).await;
-    }
-
-    async fn code_lens(&self, params: CodeLensParams) -> LspResult<Option<Vec<CodeLens>>> {
         let uri = params.text_document.uri;
-        let Some(requests) = self.request_lines(&uri).await else {
-            return Ok(None);
-        };
-        let cache = self.cache.read().await;
-        let mut lenses = Vec::with_capacity(requests.len() * 4 + 1);
-
-        for (index, &line) in requests.iter().enumerate() {
-            let range = line_range(line);
-            if index == 0 {
-                lenses.push(lens(range, "▶ Send All", CMD_SEND_ALL, &uri, line));
-            }
-            lenses.push(lens(range, "▶ Send", CMD_SEND, &uri, line));
-            if let Some(cached) = cache.get(&(uri.clone(), line)) {
-                lenses.push(location_lens(range, "👁 Show", &uri, line, &cached.full_uri));
-                lenses.push(location_lens(
-                    range,
-                    "◉ Headers",
-                    &uri,
-                    line,
-                    &cached.headers_uri,
-                ));
-                lenses.push(lens(range, "💾 Save", CMD_SAVE, &uri, line));
-            }
-        }
-
-        Ok(Some(lenses))
+        self.documents.write().await.remove(&uri);
+        self.client.publish_diagnostics(uri, Vec::new(), None).await;
     }
 
-    async fn execute_command(&self, params: ExecuteCommandParams) -> LspResult<Option<Value>> {
-        let Some((uri, line)) = parse_args(&params.arguments) else {
-            self.show_error("command is missing its URI or line argument")
-                .await;
+    async fn completion(&self, params: CompletionParams) -> LspResult<Option<CompletionResponse>> {
+        let position = params.text_document_position;
+        let Some(open) = self.document(&position.text_document.uri).await else {
             return Ok(None);
         };
+        let known = self.known(&position.text_document.uri).await;
+        let items = assist::complete(&open.text, &open.document, position.position, &known);
+        Ok((!items.is_empty()).then_some(CompletionResponse::Array(items)))
+    }
 
-        match params.command.as_str() {
-            CMD_SEND => self.spawn_execute(uri, Some(line), line),
-            CMD_SEND_ALL => self.spawn_execute(uri, None, line),
-            CMD_SAVE => self.run_save(uri, line).await,
-            command => self.show_error(format!("unknown command {command}")).await,
-        }
-
-        Ok(None)
+    async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
+        let position = params.text_document_position_params;
+        let Some(open) = self.document(&position.text_document.uri).await else {
+            return Ok(None);
+        };
+        let known = self.known(&position.text_document.uri).await;
+        Ok(assist::hover(
+            &open.text,
+            &open.document,
+            position.position,
+            &known,
+        ))
     }
 
     async fn shutdown(&self) -> LspResult<()> {
-        let _ = tokio::fs::remove_dir_all(self.response_directory.as_ref()).await;
+        // Dropping the listeners removes their sockets.
+        self.listeners.lock().await.clear();
         Ok(())
     }
 }
 
-impl Backend {
-    /// Requests can run for minutes, so execute them in the background instead of holding the
-    /// executeCommand request open past the client's request timeout.
-    fn spawn_execute(&self, uri: Url, line: Option<u32>, cache_line: u32) {
-        let backend = self.clone();
-        tokio::spawn(async move { backend.run_execute(uri, line, cache_line).await });
-    }
-
-    async fn run_execute(&self, uri: Url, line: Option<u32>, cache_line: u32) {
-        let title = if line.is_some() {
-            "Sending request"
-        } else {
-            "Sending all requests"
-        };
-        let progress = self.begin_progress(title).await;
-        let result = self.execute(&uri, line, cache_line).await;
-        self.end_progress(progress).await;
-
-        match result {
-            Ok(summary) if summary.failed > 0 => {
-                self.client
-                    .show_message(
-                        MessageType::WARNING,
-                        format!(
-                            "zed-http: {} of {} request(s) failed; use the Show or Headers code lens for details",
-                            summary.failed, summary.executed
-                        ),
-                    )
-                    .await;
-            }
-            Ok(_) => {
-                self.client
-                    .show_message(
-                        MessageType::INFO,
-                        "zed-http: response ready; use the Show or Headers code lens",
-                    )
-                    .await;
-            }
-            Err(error) => self.show_error(error).await,
-        }
-    }
-
-    async fn execute(
-        &self,
-        uri: &Url,
-        line: Option<u32>,
-        cache_line: u32,
-    ) -> Result<RunSummary, String> {
-        let path = uri
-            .to_file_path()
-            .map_err(|()| format!("cannot execute non-file URI {uri}"))?;
-        let text = self
-            .documents
-            .read()
-            .await
-            .get(uri)
-            .map(|document| document.text.clone())
-            .ok_or_else(|| format!("cannot execute unopened document {uri}"))?;
-
-        let report = {
-            let _execution_guard = self.execution_lock.lock().await;
-            let environment = env::var("ZED_HTTP_ENV").ok();
-            Arc::new(
-                self.runner
-                    .run(&path, &text, line, environment.as_deref())
-                    .await?,
-            )
-        };
-
-        let directory = self.response_directory.as_ref();
-        let full_uri = self
-            .write_response_file(uri, cache_line, &report, OutputView::Full, directory)
-            .await
-            .map_err(|error| format!("failed to store response: {error}"))?;
-        let headers_uri = self
-            .write_response_file(uri, cache_line, &report, OutputView::HeadersOnly, directory)
-            .await
-            .map_err(|error| format!("failed to store response headers: {error}"))?;
-        let summary = report.summary();
-        self.cache.write().await.insert(
-            (uri.clone(), cache_line),
-            CachedResponse {
-                report,
-                full_uri,
-                headers_uri,
-            },
-        );
-        let _ = self.client.code_lens_refresh().await;
-        Ok(summary)
-    }
-
-    async fn begin_progress(&self, title: &str) -> Option<ProgressToken> {
-        if !self.work_done_progress.load(Ordering::Relaxed) {
-            return None;
-        }
-        let token = NumberOrString::String(format!(
-            "zed-http/{}",
-            self.next_progress_id.fetch_add(1, Ordering::Relaxed)
-        ));
-        self.client
-            .send_request::<request::WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
-                token: token.clone(),
-            })
-            .await
-            .ok()?;
-        self.client
-            .send_notification::<notification::Progress>(ProgressParams {
-                token: token.clone(),
-                value: ProgressParamsValue::WorkDone(WorkDoneProgress::Begin(
-                    WorkDoneProgressBegin {
-                        title: title.to_owned(),
-                        cancellable: Some(false),
-                        message: None,
-                        percentage: None,
-                    },
-                )),
-            })
-            .await;
-        Some(token)
-    }
-
-    async fn end_progress(&self, token: Option<ProgressToken>) {
-        let Some(token) = token else {
-            return;
-        };
-        self.client
-            .send_notification::<notification::Progress>(ProgressParams {
-                token,
-                value: ProgressParamsValue::WorkDone(WorkDoneProgress::End(WorkDoneProgressEnd {
-                    message: None,
-                })),
-            })
-            .await;
-    }
-
-    async fn run_save(&self, uri: Url, line: u32) {
-        let Some(cached) = self.cached_response(&uri, line).await else {
-            return;
-        };
-        let Some(directory) = uri
-            .to_file_path()
-            .ok()
-            .and_then(|path| path.parent().map(Path::to_path_buf))
-        else {
-            self.show_error(format!("cannot resolve the parent directory for {uri}"))
-                .await;
-            return;
-        };
-        match self
-            .write_response_file(&uri, line, &cached.report, OutputView::Full, &directory)
-            .await
-        {
-            Ok(target) => {
-                self.client
-                    .show_message(
-                        MessageType::INFO,
-                        format!("zed-http: saved response to {target}"),
-                    )
-                    .await;
-            }
-            Err(error) => {
-                self.show_error(format!("failed to save response: {error}"))
-                    .await
-            }
-        }
-    }
-
-    async fn write_response_file(
-        &self,
-        uri: &Url,
-        line: u32,
-        report: &Report,
-        view: OutputView,
-        directory: &Path,
-    ) -> Result<Url, String> {
-        let base = uri
-            .to_file_path()
-            .ok()
-            .and_then(|path| {
-                path.file_stem()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .unwrap_or_else(|| "response".to_owned());
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let target = directory.join(format!(
-            "{base}-line{}-{timestamp}.http-resp",
-            line.saturating_add(1)
-        ));
-        let body = report.render(view);
-        let parent = target
-            .parent()
-            .ok_or_else(|| format!("{} has no parent directory", target.display()))?;
-        create_private_directory(parent).await?;
-        write_private_file(&target, body.as_bytes()).await?;
-        Url::from_file_path(&target)
-            .map_err(|()| format!("cannot convert {} to a file URI", target.display()))
-    }
-}
-
-async fn create_private_directory(path: &Path) -> Result<(), String> {
-    let mut builder = tokio::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    builder.mode(0o700);
-    builder
-        .create(path)
-        .await
-        .map_err(|error| format!("failed to create {}: {error}", path.display()))
-}
-
-async fn write_private_file(path: &Path, body: &[u8]) -> Result<(), String> {
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let mut file = options
-        .open(path)
-        .await
-        .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
-    file.write_all(body)
-        .await
-        .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
-    file.flush()
-        .await
-        .map_err(|error| format!("failed to flush {}: {error}", path.display()))
-}
-
-/// Workspace folders bound the env file search; `rootUri` is the fallback for older clients.
+/// Workspace folders bound the env file search and key the task sockets; `rootUri` is the
+/// fallback for older clients.
 #[allow(deprecated)]
 fn workspace_roots(params: &InitializeParams) -> Vec<PathBuf> {
     let folders = params
@@ -502,6 +298,7 @@ fn workspace_roots(params: &InitializeParams) -> Vec<PathBuf> {
     folders
         .chain(params.root_uri.as_ref())
         .filter_map(|uri| uri.to_file_path().ok())
+        .map(|path| fs::canonicalize(&path).unwrap_or(path))
         .collect()
 }
 
@@ -513,93 +310,15 @@ fn full_document_text(changes: &[TextDocumentContentChangeEvent]) -> Option<&str
         .map(|change| change.text.as_str())
 }
 
-fn line_range(line: u32) -> Range {
-    Range {
-        start: Position::new(line, 0),
-        end: Position::new(line, 0),
-    }
-}
-
-fn command_args(uri: &Url, line: u32) -> Vec<Value> {
-    vec![Value::String(uri.to_string()), Value::from(line)]
-}
-
-fn lens(range: Range, title: &str, command: &str, uri: &Url, line: u32) -> CodeLens {
-    CodeLens {
-        range,
-        command: Some(Command {
-            title: title.to_owned(),
-            command: command.to_owned(),
-            arguments: Some(command_args(uri, line)),
-        }),
-        data: None,
-    }
-}
-
-fn location_lens(
-    range: Range,
-    title: &str,
-    source_uri: &Url,
-    source_line: u32,
-    target_uri: &Url,
-) -> CodeLens {
-    CodeLens {
-        range,
-        command: Some(Command {
-            title: title.to_owned(),
-            command: CMD_GO_TO_LOCATIONS.to_owned(),
-            arguments: Some(vec![
-                Value::String(source_uri.to_string()),
-                serde_json::json!({ "line": source_line, "character": 0 }),
-                serde_json::json!([{
-                    "uri": target_uri,
-                    "range": {
-                        "start": { "line": 0, "character": 0 },
-                        "end": { "line": 0, "character": 0 }
-                    }
-                }]),
-            ]),
-        }),
-        data: None,
-    }
-}
-
-fn parse_args(arguments: &[Value]) -> Option<(Url, u32)> {
-    let uri = arguments.first()?.as_str()?;
-    let line = arguments.get(1)?.as_u64()?.try_into().ok()?;
-    Some((Url::parse(uri).ok()?, line))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn parses_command_arguments() {
-        let arguments = vec![
-            Value::String("file:///tmp/example.http".to_owned()),
-            Value::from(4),
-        ];
-        let (uri, line) = parse_args(&arguments).unwrap();
-        assert_eq!(uri.as_str(), "file:///tmp/example.http");
-        assert_eq!(line, 4);
-    }
-
-    #[test]
-    fn response_locations_use_zeds_client_side_navigation_command() {
-        let source = Url::parse("file:///tmp/example.http").unwrap();
-        let target = Url::parse("file:///tmp/example.http-resp").unwrap();
-        let lens = location_lens(line_range(2), "Show", &source, 2, &target);
-        let command = lens.command.unwrap();
-        assert_eq!(command.command, CMD_GO_TO_LOCATIONS);
-        assert_eq!(command.arguments.unwrap()[2][0]["uri"], target.as_str());
-    }
-
-    #[test]
     fn only_full_document_changes_are_indexable() {
         let changes = vec![
             TextDocumentContentChangeEvent {
-                range: Some(line_range(2)),
+                range: Some(Range::new(Position::new(2, 0), Position::new(2, 0))),
                 range_length: None,
                 text: "partial".to_owned(),
             },

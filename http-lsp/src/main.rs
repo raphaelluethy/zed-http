@@ -1,6 +1,13 @@
 use std::io::{IsTerminal, Write};
 use tower_lsp::{LspService, Server};
-use zed_http_lsp::{backend::Backend, runner::Runner, script, session::Session, terminal};
+use zed_http_lsp::{
+    backend::Backend,
+    runner::Runner,
+    script,
+    session::Session,
+    task::{self, TaskRequest},
+    terminal,
+};
 
 fn main() {
     // Scripts run in short-lived copies of this executable so they can be killed.
@@ -54,38 +61,34 @@ async fn run_request() -> Result<bool, String> {
     if args.next().is_some() {
         return Err("unexpected argument after the request selection".into());
     }
-    let file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|error| error.to_string())?;
-    let mut text = String::new();
-    use tokio::io::AsyncReadExt;
-    file.take(16 * 1024 * 1024 + 1)
-        .read_to_string(&mut text)
-        .await
-        .map_err(|error| error.to_string())?;
-    if text.len() > 16 * 1024 * 1024 {
-        return Err("HTTP file is larger than 16 MiB".into());
-    }
-    let runner = Runner::new(Session::new());
-    runner.set_workspace_roots(vec![
-        std::env::current_dir().map_err(|error| error.to_string())?
-    ]);
-    let environment = std::env::var("ZED_HTTP_ENV").ok();
-    let report = runner
-        .run(&path, &text, line, environment.as_deref())
-        .await?;
-    let color = terminal::colors_enabled(std::io::stdout().is_terminal());
-    let output = terminal::render(&report, color);
+    let root = std::env::current_dir().map_err(|error| error.to_string())?;
+    let request = TaskRequest::new(
+        std::path::absolute(&path).map_err(|error| error.to_string())?,
+        line,
+        std::env::var("ZED_HTTP_ENV").ok(),
+        terminal::colors_enabled(std::io::stdout().is_terminal()),
+    );
+    // Zed runs tasks in the worktree root, which identifies its language server.
+    let outcome = match task::forward(&root, &request).await {
+        Some(outcome) => outcome?,
+        None => {
+            if cfg!(unix) {
+                eprintln!(
+                    "zed-http: the HTTP language server is not running, so this run starts \
+                     without the globals and cookies of earlier runs"
+                );
+            }
+            let runner = Runner::new(Session::new());
+            runner.set_workspace_roots(vec![root]);
+            task::execute(&runner, &request).await?
+        }
+    };
     let mut stdout = std::io::stdout().lock();
     stdout
-        .write_all(output.as_bytes())
+        .write_all(outcome.output.as_bytes())
         .map_err(|error| error.to_string())?;
     stdout.flush().map_err(|error| error.to_string())?;
-    let summary = report.summary();
-    if summary.executed == 0 {
-        return Err("no requests were executed".into());
-    }
-    Ok(summary.failed == 0)
+    Ok(outcome.success)
 }
 
 async fn serve() {

@@ -3,42 +3,44 @@
 
 # HTTP extension for Zed
 
-`zed-http` lets projects share JetBrains-style `.http` files between IntelliJ-based IDEs and Zed. Kulala LS provides language intelligence; this project's own adapter parses and sends the requests. It is not affiliated with JetBrains or the Kulala project.
+`zed-http` lets projects share JetBrains-style `.http` files between IntelliJ-based IDEs and Zed. A single native binary, `zed-http-lsp`, provides completion and hover and sends the requests, printing responses to Zed's terminal. It is not affiliated with JetBrains.
 
 ## Architecture
 
-Zed runs two language servers for `.http` files:
+`zed-http-lsp` is a single native binary with two roles:
 
-- **Kulala LS** (`@mistweaverco/kulala-ls@1.11.1`) is the HTTP language server and owns completion and hover.
-- **The execution adapter** (`zed-http-lsp`) is a single native binary that owns code lenses, commands, response buffers and request execution. Zed currently exposes these editor actions to extensions through a language-server slot, so the adapter speaks the narrow LSP subset required for them.
+- **Language server.** Zed starts it for `.http` files. It provides completion, hover and parse diagnostics, and keeps the session (`client.global` values, cookies and named responses) in memory.
+- **Task runner.** The gutter run arrow starts it as a Zed task with `--run`. The task forwards the request over a private local socket to the language server of its workspace, which sends it with the shared session and returns the rendered response to the terminal.
 
-The adapter parses `.http` files, resolves variables, runs scripts and sends requests in process. It needs no sidecar, Node.js or other runtime.
+It parses `.http` files, resolves variables, runs scripts and sends requests in process. It needs no sidecar, Node.js or other runtime.
 
 ```diagram
-┌─────┐     ┌───────────┐
-│ Zed │────▶│ Kulala LS │  completion and hover
-└──┬──┘     └───────────┘
-   │
-   ▼
-┌──────────────────────────────────────────┐
-│ zed-http-lsp                             │
-│ parser · variables · scripts (Boa) ·     │
-│ HTTP / GraphQL / WebSocket / gRPC        │
-└──────────────────────────────────────────┘
+┌─────┐  completion, hover   ┌──────────────────────────────────────────┐
+│ Zed │─────────────────────▶│ zed-http-lsp (language server)           │
+└──┬──┘                      │ session · parser · variables · scripts · │
+   │ ▶ gutter task           │ HTTP / GraphQL / WebSocket / gRPC        │
+   ▼                         └──────────────────────────────────────────┘
+┌──────────────────────┐   local socket    ▲
+│ zed-http-lsp --run   │───────────────────┘
+│ prints to terminal   │
+└──────────────────────┘
 ```
 
-Inside the adapter:
+Inside the binary:
 
 - `syntax.rs` parses the IntelliJ HTTP client format.
+- `assist.rs` provides completion, hover and diagnostics.
+- `task.rs` forwards terminal runs to the language server.
 - `variables.rs` resolves environments, file variables, dynamic variables and named-response references.
 - `script.rs` runs pre-request scripts and response handlers on the embedded [Boa](https://boajs.dev) JavaScript engine.
 - `protocol/` sends HTTP requests (reqwest over rustls), GraphQL, WebSocket and gRPC.
 
 ## Features
 
-- Syntax highlighting, completion and hover for HTTP files
-- **▶ Send** and **▶ Send All** code lenses that use the current in-memory document, including unsaved edits
-- Response buffers with full, headers-only, reopen and save actions
+- Syntax highlighting and parse diagnostics for HTTP files
+- Completion for methods, headers and common header values, `# @` directives, `{{variables}}` (env files, file variables, `client.global` values, names set by scripts, named responses) and dynamic variables
+- Hover on `{{variable}}` showing its value, where it comes from and what it overrides
+- A gutter run arrow on every request that prints the response in Zed's terminal, with JSON pretty-printed and colored
 - IntelliJ-style requests:
   - `###` separators, `# @name`, request lines with an optional HTTP version, multi-line URLs and headers
   - `@no-redirect`, `@no-cookie-jar`, `@no-log`, `@timeout` and `@connection-timeout`. For HTTP and GraphQL, `@timeout` is an inactivity timeout: it ends a request that receives nothing for that long, so slow streams keep going, and the whole request is still capped at 5 minutes or the timeout, whichever is longer. For WebSocket and gRPC it bounds the whole exchange. Durations are seconds, or take an `ms`, `s` or `m` suffix.
@@ -50,7 +52,7 @@ Inside the adapter:
   - named-response references such as `{{login.response.body.$.token}}` and `{{login.response.headers.X-Token}}`
 - Pre-request scripts (`< {% %}` or `< file.js`) and response handlers (`> {% %}` or `> file.js`) with the IntelliJ `client`, `request` and `response` objects, plus `jsonPath`, `crypto` digests and `$random`
 - Response redirects (`>> file` and `>>! file`), `import` and `run`
-- `client.global` values and cookies shared by all requests while the adapter runs
+- `client.global` values, cookies and named responses shared by every run in the workspace until Zed restarts
 
 ### GraphQL
 
@@ -66,8 +68,8 @@ Inside the adapter:
 
 ### Known gaps compared to IntelliJ
 
-- Globals and cookies are kept in memory and are lost when Zed restarts the adapter.
-- There is no request history. `@no-log` only keeps the response body out of response buffers.
+- Globals, cookies and named responses are kept in memory, like session cookies, and are lost when Zed or the language server restarts. Restart the language server to start a fresh session.
+- There is no request history. `@no-log` only keeps the response body out of the terminal output.
 - Scripts have no `require`, timers, file system or network access, and cannot read environment variables. They run with a 10 second time limit.
 - OAuth 2.0 (`$auth.token`), client certificates and proxy settings from env files, HTTP/3 and the IntelliJ example server are not supported.
 - GraphQL `operationName` is taken from the first named operation in the query and cannot be chosen explicitly.
@@ -77,15 +79,15 @@ Inside the adapter:
 
 ## Installation and use
 
-Install a development checkout with **zed: install dev extension** and select this repository. When an HTTP file is first opened, Zed installs the pinned Kulala LS package and downloads this project's platform archive, which contains only `zed-http-lsp`. If the archive cannot be downloaded, for example while offline, the extension reuses a previously downloaded adapter. Without one, request execution is unavailable but completion and hover keep working.
+Install a development checkout with **zed: install dev extension** and select this repository. When an HTTP file is first opened, the extension downloads this project's platform archive, which contains only `zed-http-lsp`. If the archive cannot be downloaded, for example while offline, the extension reuses a previously downloaded binary.
 
-Use **▶ Send** above a request or `run` line, or **▶ Send All** above the first one. Requests run in the background and show progress in the status bar. After execution, the adapter refreshes the code lenses and caches the response for **Show**, **Headers** and **Save**. Click **Show** or **Headers** to open the response; Zed does not currently let a generic extension language-server process force-open a response tab.
+Click the run arrow in the gutter next to a request to send it. Zed saves the file, and the response appears in the terminal panel with its status, timing, headers, body and test results. **HTTP: Send all requests** is available through **task: spawn**. Runs share one session per workspace: a token a login handler stores with `client.global.set` is available to the next request you run. On Windows, and whenever the language server is not running, a run starts with a fresh session.
 
-Nothing is installed into the project or as a global package. Request execution does not require Node.js, npm or a task shell on `PATH`; Kulala LS runs with Zed's managed Node.js runtime.
+Nothing is installed into the project or as a global package, and nothing needs Node.js, npm or a task shell on `PATH`.
 
 ## Environments and state
 
-The adapter looks for `http-client.env.json` and `http-client.private.env.json` from the request file's directory up to the workspace root, and uses the nearest copy of each. Files outside the workspace only use env files next to them. It selects:
+The runner looks for `http-client.env.json` and `http-client.private.env.json` from the request file's directory up to the workspace root, and uses the nearest copy of each. Files outside the workspace only use env files next to them. It selects:
 
 1. `ZED_HTTP_ENV`, when configured;
 2. `default`, when present;
@@ -95,22 +97,22 @@ Variables resolve in this order, highest first: request variables set by a pre-r
 
 Keep secrets in `http-client.private.env.json` and exclude it from version control.
 
-`client.global` values, cookies and named responses live in the adapter's memory only. They are shared by every file in the Zed session and disappear when the adapter exits.
+`client.global` values, cookies and named responses live in the language server's memory only. They are shared by every file and run in the workspace and disappear when Zed or the language server restarts. Completion and hover read the same values.
 
 ## Security model
 
-Only execute `.http` files you trust. Requests can read files through body includes and write files through response redirects, with your permissions. `$env` variables in requests can read the worktree environment that the adapter inherits.
+Only execute `.http` files you trust. Requests can read files through body includes and write files through response redirects, with your permissions. `$env` variables in requests can read the worktree environment that the language server inherits.
 
-The adapter adds the following boundaries:
+`zed-http-lsp` adds the following boundaries:
 
 - Scripts run in a separate worker process (the same binary) on the embedded Boa engine. They have no file system, network or environment access, are limited in loop iterations and recursion, and are killed after 10 seconds. At most two run at once.
 - Variable expansion is bounded in depth and output size, request and response bodies are capped at 32 MiB, and HTTPS uses rustls with no OpenSSL dependency.
-- Temporary response files use a process-private directory and mode `0600` on Unix, and are removed when the adapter shuts down. Explicitly saved responses also use mode `0600` on Unix.
-- The Kulala LS version is pinned. Release CI actions are commit-pinned, write permission is limited to the publish job, and release archives include `SHA256SUMS`.
+- Terminal runs reach the language server through a Unix socket in a directory only your user can enter (`$XDG_RUNTIME_DIR` or the temp directory, mode `0700`). The socket is removed when the language server shuts down, and the session is never written to disk.
+- Release CI actions are commit-pinned, write permission is limited to the publish job, and release archives include `SHA256SUMS`.
 
-Response buffers and saved files can contain authorization headers, cookies, tokens and private response data. Review them before sharing.
+Terminal output and response redirect files can contain authorization headers, cookies, tokens and private response data. Review them before sharing.
 
-The extension capability manifest restricts downloads to this project's GitHub releases and npm installation to `@mistweaverco/kulala-ls`.
+The extension capability manifest restricts downloads to this project's GitHub releases.
 
 ## Supported platforms
 
@@ -122,36 +124,17 @@ Release bundles are built for:
 
 ## Development
 
-### Gutter run arrows
+### Gutter tasks
 
-The extension supplies a gutter run arrow on each HTTP request method, using Zed's
-runnable queries and tagged tasks. Clicking it runs **HTTP: Send request** and prints
-the response in the task terminal. **HTTP: Send all requests** is available through
-**task: spawn**. Tasks save edited buffers before reading the file. Each task starts
-a fresh runner session, so globals, cookies and named responses are shared within
-Send All but do not persist between task invocations.
+The run arrow comes from the extension's runnable query (`languages/http/runnables.scm`) and tagged task (`languages/http/tasks.json`). On macOS and Linux, the task launcher resolves the binary from Zed's installed extension without requiring it on `PATH`. A dev extension uses its checkout's `target/debug/zed-http-lsp`; a released extension uses its matching downloaded binary. Set `ZED_HTTP_LSP` in the task environment to use another binary. In this checkout, the project tasks use `cargo run` to build and start the local binary. Tasks explicitly select `/bin/sh`, so they behave the same when your default terminal shell is Fish, Bash or Zsh. File paths are passed through environment variables and quoted by the launcher command.
 
-On macOS and Linux, the task launcher resolves the adapter from Zed's installed
-extension without requiring it on `PATH`. A dev extension uses its checkout's
-`target/debug/zed-http-lsp`; a released extension uses its matching downloaded
-adapter. Set `ZED_HTTP_LSP` in the task environment to use another binary. In this
-checkout, the project tasks use `cargo run` to build and start the local adapter.
-Tasks explicitly select `/bin/sh`, so they behave the same when your default
-terminal shell is Fish, Bash or Zsh. File paths are passed through environment
-variables and quoted by the launcher command.
-Terminal responses group the request, status, timing, headers and body. JSON is
-indented and syntax-highlighted when stdout is a terminal. `NO_COLOR=1` disables
-color; `FORCE_COLOR=1` enables it for captured output. Response files opened by
-the inline Show action keep their plain HTTP format.
+JSON is indented and syntax-highlighted when stdout is a terminal. `NO_COLOR=1` disables color; `FORCE_COLOR=1` enables it for captured output.
 
-On Windows, define the tasks in the project's `.zed/tasks.json` with `command`
-set to the absolute path of `zed-http-lsp.exe` and the `--run`, `$ZED_FILE`,
-`--line`, `$ZED_ROW` arguments (omit the line arguments for Send All).
-Inline Send actions use the running language server and its in-memory session.
+On Windows, define the tasks in the project's `.zed/tasks.json` with `command` set to the absolute path of `zed-http-lsp.exe` and the `--run`, `$ZED_FILE`, `--line`, `$ZED_ROW` arguments (omit the line arguments for Send All).
 
 ### Local build
 
-Build the adapter:
+Build the binary:
 
 ```bash
 cargo build --package zed-http-lsp
@@ -184,7 +167,7 @@ node scripts/smoke_lsp.cjs
 
 ### Testing on macOS
 
-The adapter supports Apple Silicon and Intel Macs (macOS 11 or later). On a Mac, run the tests and the end-to-end smoke test:
+`zed-http-lsp` supports Apple Silicon and Intel Macs (macOS 11 or later). On a Mac, run the tests and the end-to-end smoke test:
 
 ```bash
 cargo test --workspace
