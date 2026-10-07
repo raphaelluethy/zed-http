@@ -1,0 +1,34 @@
+[
+  {
+    "label": "HTTP: Send request",
+    "command": "base=\"$HOME/Library/Application Support/Zed\"; [ -d \"$base\" ] || base=\"${XDG_DATA_HOME:-$HOME/.local/share}/zed\"; exec sh \"$base/extensions/installed/http/languages/http/run_http.sh\" --run \"$HTTP_REQUEST_FILE\" --line \"$HTTP_REQUEST_ROW\"",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "tags": [
+      "http-request"
+    ],
+    "save": "all",
+    "reveal": "always",
+    "env": {
+      "HTTP_REQUEST_FILE": "$ZED_FILE",
+      "HTTP_REQUEST_ROW": "$ZED_ROW"
+    },
+    "shell": {
+      "program": "/bin/sh"
+    },
+    "show_command": false
+  },
+  {
+    "label": "HTTP: Send all requests",
+    "command": "base=\"$HOME/Library/Application Support/Zed\"; [ -d \"$base\" ] || base=\"${XDG_DATA_HOME:-$HOME/.local/share}/zed\"; exec sh \"$base/extensions/installed/http/languages/http/run_http.sh\" --run \"$HTTP_REQUEST_FILE\"",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "save": "all",
+    "reveal": "always",
+    "env": {
+      "HTTP_REQUEST_FILE": "$ZED_FILE"
+    },
+    "shell": {
+      "program": "/bin/sh"
+    },
+    "show_command": false
+  }
+]

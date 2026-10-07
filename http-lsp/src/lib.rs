@@ -8,4 +8,5 @@ pub mod runner;
 pub mod script;
 pub mod session;
 pub mod syntax;
+pub mod terminal;
 pub mod variables;

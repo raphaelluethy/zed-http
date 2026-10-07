@@ -122,6 +122,35 @@ Release bundles are built for:
 
 ## Development
 
+### Gutter run arrows
+
+The extension supplies a gutter run arrow on each HTTP request method, using Zed's
+runnable queries and tagged tasks. Clicking it runs **HTTP: Send request** and prints
+the response in the task terminal. **HTTP: Send all requests** is available through
+**task: spawn**. Tasks save edited buffers before reading the file. Each task starts
+a fresh runner session, so globals, cookies and named responses are shared within
+Send All but do not persist between task invocations.
+
+On macOS and Linux, the task launcher resolves the adapter from Zed's installed
+extension without requiring it on `PATH`. A dev extension uses its checkout's
+`target/debug/zed-http-lsp`; a released extension uses its matching downloaded
+adapter. Set `ZED_HTTP_LSP` in the task environment to use another binary. In this
+checkout, the project tasks use `cargo run` to build and start the local adapter.
+Tasks explicitly select `/bin/sh`, so they behave the same when your default
+terminal shell is Fish, Bash or Zsh. File paths are passed through environment
+variables and quoted by the launcher command.
+Terminal responses group the request, status, timing, headers and body. JSON is
+indented and syntax-highlighted when stdout is a terminal. `NO_COLOR=1` disables
+color; `FORCE_COLOR=1` enables it for captured output. Response files opened by
+the inline Show action keep their plain HTTP format.
+
+On Windows, define the tasks in the project's `.zed/tasks.json` with `command`
+set to the absolute path of `zed-http-lsp.exe` and the `--run`, `$ZED_FILE`,
+`--line`, `$ZED_ROW` arguments (omit the line arguments for Send All).
+Inline Send actions use the running language server and its in-memory session.
+
+### Local build
+
 Build the adapter:
 
 ```bash
