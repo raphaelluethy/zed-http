@@ -8,7 +8,7 @@ repository = "https://github.com/raphaelluethy/zed-http"
 
 [grammars.http]
 repository = "https://github.com/rest-nvim/tree-sitter-http"
-rev = "e061995f0caf2fa30f68fa1fdf2c08bcbd4629a8"
+rev = "db8b4398de90b6d0b6c780aba96aaa2cd8e9202c"
 
 [language_servers.zed-http-lsp]
 name = "HTTP Language Server"
