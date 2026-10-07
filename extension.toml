@@ -1,7 +1,7 @@
 id = "http"
 name = "HTTP"
 description = "HTTP file support with built-in request execution"
-version = "0.0.4"
+version = "0.1.0"
 schema_version = 1
 authors = ["raphael@lty.gg"]
 repository = "https://github.com/raphaelluethy/zed-http"
