@@ -92,6 +92,20 @@ async fn terminal_json_is_pretty_and_color_can_be_enabled_or_disabled() {
     }
 }
 
+#[tokio::test]
+async fn asynchronous_test_callbacks_fail_the_run() {
+    let workspace = Workspace::new(start_server().await);
+    workspace.write(
+        "requests with spaces.http",
+        "GET {{baseUrl}}/json\n> {%\nclient.test('must fail', async () => { client.assert(false, 'intentional failure'); });\n%}\n",
+    );
+    let result = run(&workspace, &[]).await;
+    let output = String::from_utf8_lossy(&result.stdout);
+    assert!(!result.status.success(), "{result:?}");
+    assert!(output.contains("✗ must fail"), "{output}");
+    assert!(!output.contains("✓ must fail"), "{output}");
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn packaged_task_finds_the_installed_dev_adapter_without_path_setup() {
@@ -126,6 +140,230 @@ async fn packaged_task_finds_the_installed_dev_adapter_without_path_setup() {
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     assert!(String::from_utf8_lossy(&output.stdout).contains("200 OK"));
+}
+
+#[cfg(unix)]
+fn launcher_target() -> &'static str {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => "aarch64-apple-darwin",
+        ("macos", "x86_64") => "x86_64-apple-darwin",
+        ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
+        ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
+        _ => "unknown-target",
+    }
+}
+
+#[cfg(unix)]
+fn record_key(root: &str) -> String {
+    let hash = root
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    format!("{hash:016x}.path")
+}
+
+#[cfg(unix)]
+struct LauncherHome {
+    root: std::path::PathBuf,
+    work: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+fn launcher_home(workspace: &Workspace) -> LauncherHome {
+    let home = workspace.root.join("launcher-home");
+    let zed = home.join("Library/Application Support/Zed");
+    let installed = zed.join("extensions/installed/http");
+    let languages = installed.join("languages/http");
+    std::fs::create_dir_all(&languages).unwrap();
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    std::fs::copy(
+        repository.join("languages/http/run_http.sh"),
+        languages.join("run_http.sh"),
+    )
+    .unwrap();
+    std::fs::write(installed.join("extension.toml"), "version = \"9.9.9\"\n").unwrap();
+    let work = zed.join("extensions/work/http");
+    std::fs::create_dir_all(&work).unwrap();
+    LauncherHome { root: home, work }
+}
+
+#[cfg(unix)]
+impl LauncherHome {
+    fn write_adapter(&self, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = self.work.join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        let binary = directory.join("zed-http-lsp");
+        std::fs::write(&binary, format!("#!/bin/sh\necho 'adapter {name}'\n")).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        binary
+    }
+
+    fn write_record(&self, root: &str, adapter: &str) {
+        let records = self.work.join("active-servers");
+        std::fs::create_dir_all(&records).unwrap();
+        std::fs::write(
+            records.join(record_key(root)),
+            format!("{root}\n{adapter}\n"),
+        )
+        .unwrap();
+    }
+}
+
+#[cfg(unix)]
+async fn run_launcher_task(
+    workspace: &Workspace,
+    home: &LauncherHome,
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
+    let path = workspace.write("requests with spaces.http", "GET {{baseUrl}}/json\n");
+    let templates: serde_json::Value =
+        serde_json::from_str(include_str!("../../languages/http/tasks.json")).unwrap();
+    let task = &templates[0];
+    let mut command = Command::new(task["shell"]["program"].as_str().unwrap());
+    command
+        .arg("-c")
+        .arg(task["command"].as_str().unwrap())
+        .env("HTTP_REQUEST_FILE", &path)
+        .env("HTTP_REQUEST_ROW", "1")
+        .env("HOME", &home.root)
+        .env("ZED_HTTP_ENV", "test")
+        .env_remove("ZED_HTTP_LSP")
+        .current_dir(&workspace.root);
+    for (name, value) in extra_env {
+        command.env(name, value);
+    }
+    command.output().await.unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn launcher_falls_back_to_newest_numeric_install() {
+    let workspace = Workspace::new(start_server().await);
+    let home = launcher_home(&workspace);
+    home.write_adapter(&format!("zed-http-lsp-{}-9.9.8", launcher_target()));
+    let output = run_launcher_task(&workspace, &home, &[]).await;
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("adapter zed-http-lsp"), "{text}");
+    assert!(text.contains("9.9.8"), "{text}");
+
+    home.write_adapter(&format!("zed-http-lsp-{}-9.10.0", launcher_target()));
+    home.write_adapter(&format!("zed-http-lsp-{}-other", launcher_target()));
+    home.write_adapter(&format!(
+        "zed-http-lsp-{}-99.0.0",
+        if launcher_target() == "aarch64-apple-darwin" {
+            "x86_64-apple-darwin"
+        } else {
+            "aarch64-apple-darwin"
+        }
+    ));
+    let output = run_launcher_task(&workspace, &home, &[]).await;
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("9.10.0"), "{text}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn launcher_prefers_the_recorded_adapter_for_this_workspace() {
+    let workspace = Workspace::new(start_server().await);
+    let home = launcher_home(&workspace);
+    let spaced = home.work.join("adapters/with spaces");
+    std::fs::create_dir_all(&spaced).unwrap();
+    let recorded = spaced.join("zed-http-lsp");
+    std::fs::write(&recorded, "#!/bin/sh\necho 'recorded adapter'\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&recorded, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let root = workspace.root.to_string_lossy().into_owned();
+    home.write_record(&root, &recorded.to_string_lossy());
+    home.write_record("/nonexistent/other-workspace", "/nonexistent/adapter");
+    let records = home.work.join("active-servers");
+    std::fs::write(records.join("deadbeefdeadbeef.path"), "\n").unwrap();
+    std::fs::write(records.join("aaaaaaaaaaaaaaaa.tmp"), "tmp\n").unwrap();
+
+    let output = run_launcher_task(&workspace, &home, &[]).await;
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("recorded adapter"), "{text}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn launcher_ignores_a_stale_record_and_uses_the_extension_version() {
+    let workspace = Workspace::new(start_server().await);
+    let home = launcher_home(&workspace);
+    let root = workspace.root.to_string_lossy().into_owned();
+    home.write_record(&root, &format!("{}/gone", home.work.display()));
+    home.write_adapter(&format!("zed-http-lsp-{}-9.9.9", launcher_target()));
+    let output = run_launcher_task(&workspace, &home, &[]).await;
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("9.9.9"), "{text}");
+
+    let relative = home.write_adapter(&format!("zed-http-lsp-{}-9.9.7", launcher_target()));
+    let relative_name = relative
+        .strip_prefix(&home.work)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    home.write_record(&root, &relative_name);
+    let output = run_launcher_task(&workspace, &home, &[]).await;
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("9.9.7"), "{text}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn launcher_explicit_override_wins_and_bad_override_fails() {
+    let workspace = Workspace::new(start_server().await);
+    let home = launcher_home(&workspace);
+    let explicit = home.write_adapter("explicit/zed-http-lsp");
+    home.write_adapter(&format!("zed-http-lsp-{}-9.9.9", launcher_target()));
+
+    let output = run_launcher_task(
+        &workspace,
+        &home,
+        &[("ZED_HTTP_LSP", &explicit.to_string_lossy())],
+    )
+    .await;
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("adapter explicit"), "{text}");
+
+    let output =
+        run_launcher_task(&workspace, &home, &[("ZED_HTTP_LSP", "/missing/adapter")]).await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("adapter not found"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn launcher_record_wins_over_a_dev_checkout() {
+    let workspace = Workspace::new(start_server().await);
+    let home = launcher_home(&workspace);
+    let installed = home
+        .root
+        .join("Library/Application Support/Zed/extensions/installed/http");
+    std::fs::remove_dir_all(&installed).unwrap();
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap();
+    std::os::unix::fs::symlink(repository, &installed).unwrap();
+    let recorded = home.write_adapter("recorded/zed-http-lsp");
+    let root = workspace.root.to_string_lossy().into_owned();
+    home.write_record(&root, &recorded.to_string_lossy());
+    let output = run_launcher_task(&workspace, &home, &[]).await;
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("adapter recorded"), "{text}");
 }
 
 /// Starts the language server for `root` and waits until it has answered `initialize` and

@@ -151,6 +151,39 @@ async fn reports_refused_upgrades_and_connection_failures() {
 }
 
 #[tokio::test]
+async fn separator_comments_do_not_change_frames() {
+    let address = start_echo_server().await;
+    let workspace = Workspace::new(address);
+    let runner = workspace.runner();
+    let text = format!(
+        "\
+# @timeout 1s
+WEBSOCKET ws://{address}/socket
+X-Token: {{{{token}}}}
+
+=== // first message
+delay
+=== wait-for-server // hold for the reply
+token?
+=== // last message
+last // one
+"
+    );
+    let report = workspace.run(&runner, &text, None).await;
+    let rendered = report.render(OutputView::Full);
+    assert_eq!(report.summary().failed, 0, "{rendered}");
+    let transcript = rendered
+        .split_once("→ delay")
+        .map(|(_, rest)| rest)
+        .unwrap_or_else(|| panic!("{rendered}"));
+    assert_eq!(
+        transcript,
+        "\n← late\n→ token?\n→ last // one\n← token: env-token\n← echo: last // one\n# stopped listening after 1 s\n",
+        "{rendered}"
+    );
+}
+
+#[tokio::test]
 async fn an_unmet_wait_for_server_fails_the_request() {
     let address = start_echo_server().await;
     let workspace = Workspace::new(address);

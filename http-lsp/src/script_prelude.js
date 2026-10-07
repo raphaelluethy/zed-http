@@ -227,7 +227,10 @@
                 break;
             }
             try {
-                test.callback();
+                const result = test.callback();
+                if (result !== null && (typeof result === "object" || typeof result === "function") && typeof result.then === "function") {
+                    throw new Error("Asynchronous test callbacks are not supported");
+                }
                 state.tests.push({ name: test.name, passed: true });
             } catch (error) {
                 if (error === EXIT) break;

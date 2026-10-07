@@ -1,9 +1,8 @@
 //! Terminal presentation for gutter tasks. Response files keep their plain HTTP format.
 
-use std::fmt::Write as _;
+use std::{borrow::Cow, fmt::Write as _};
 
 use http::StatusCode;
-use serde_json::Value;
 
 use crate::report::Report;
 
@@ -155,23 +154,23 @@ pub fn render(report: &Report, color: bool) -> String {
             }
         }
         if let Some(body) = &execution.body {
-            let text = body.formatted.clone().or_else(|| {
-                body.content
-                    .as_ref()
-                    .and_then(|value| serde_json::to_string_pretty(value).ok())
+            let text = body.formatted.as_deref().map(Cow::Borrowed).or_else(|| {
+                body.content.as_ref().map(|value| {
+                    Cow::Owned(
+                        crate::report::pretty_json(value, crate::protocol::MAX_BODY_BYTES)
+                            .unwrap_or_else(|_| {
+                                "<JSON display omitted: formatted body exceeds 32 MiB>".to_owned()
+                            }),
+                    )
+                })
             });
             if let Some(text) = text.filter(|text| !text.is_empty()) {
                 let _ = writeln!(output, "\n  {}", paint("Body", DIM, color));
-                let text = match serde_json::from_str::<Value>(&text) {
-                    Ok(value) => {
-                        let pretty = serde_json::to_string_pretty(&value).unwrap_or(text);
-                        if color {
-                            highlight_json(&pretty)
-                        } else {
-                            pretty
-                        }
-                    }
-                    Err(_) => clean(&text),
+                let json = body.content.is_some() && !text.starts_with('<');
+                let text = if json && color {
+                    Cow::Owned(highlight_json(&text))
+                } else {
+                    Cow::Owned(clean(&text))
                 };
                 output.push_str(&text);
                 if !text.ends_with('\n') {
@@ -287,7 +286,7 @@ mod tests {
                 success: true,
                 status: Some(200),
                 body: Some(Body {
-                    formatted: Some(value.to_string()),
+                    formatted: Some(serde_json::to_string_pretty(&value).unwrap()),
                     content: Some(value.clone()),
                 }),
                 ..Default::default()
@@ -306,6 +305,54 @@ mod tests {
             stripped = stripped.replace(code, "");
         }
         assert_eq!(stripped, plain);
+    }
+
+    #[test]
+    fn scalar_json_and_omission_notes_and_plain_text_keep_their_shape() {
+        let report = Report {
+            executions: vec![
+                Execution {
+                    success: true,
+                    body: Some(Body {
+                        formatted: Some("7".into()),
+                        content: Some(serde_json::json!(7)),
+                    }),
+                    ..Default::default()
+                },
+                Execution {
+                    success: true,
+                    body: Some(Body {
+                        formatted: Some(
+                            "<JSON display omitted: formatted body exceeds 32 MiB>".into(),
+                        ),
+                        content: Some(serde_json::json!({ "a": 1 })),
+                    }),
+                    ..Default::default()
+                },
+                Execution {
+                    success: true,
+                    body: Some(Body {
+                        formatted: Some("{\"compact\":true}".into()),
+                        content: None,
+                    }),
+                    ..Default::default()
+                },
+            ],
+        };
+        let plain = render(&report, false);
+        assert!(plain.contains("\n7\n"), "{plain}");
+        assert!(
+            plain.contains("<JSON display omitted: formatted body exceeds 32 MiB>"),
+            "{plain}"
+        );
+        assert!(plain.contains("{\"compact\":true}"), "{plain}");
+        assert!(!plain.contains("\n  \"compact\":"), "{plain}");
+        let colored = render(&report, true);
+        assert!(
+            colored.contains("\n<JSON display omitted: formatted body exceeds 32 MiB>\n"),
+            "{colored}"
+        );
+        assert!(colored.contains("\x1b[35m7\x1b[0m"), "{colored}");
     }
 
     #[test]

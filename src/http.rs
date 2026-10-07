@@ -85,6 +85,7 @@ impl HttpExtension {
             .and_then(|settings| settings.arguments.clone())
             .unwrap_or_default();
         let command = self.server_binary_path(language_server_id, configured_path)?;
+        record_server_path(Path::new("active-servers"), &worktree.root_path(), &command)?;
 
         let mut command_env = worktree.shell_env();
         if let Some(overrides) = binary_settings.and_then(|settings| settings.env) {
@@ -225,6 +226,45 @@ fn download_server(
         unavailable(format!("installing {version_directory} failed ({error})"))
     })?;
     Ok(())
+}
+
+fn record_server_path(directory: &Path, root: &str, binary: &str) -> zed::Result<()> {
+    if root.contains(['\r', '\n']) || binary.contains(['\r', '\n']) {
+        return Err("HTTP adapter paths cannot contain line breaks".into());
+    }
+    let key = root
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+    let target = directory.join(format!("{key:016x}.path"));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    for attempt in 0..32u32 {
+        let temporary = directory.join(format!("{key:016x}-{stamp:x}-{attempt:x}.tmp"));
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.to_string()),
+        };
+        let written =
+            std::io::Write::write_all(&mut file, format!("{root}\n{binary}\n").as_bytes());
+        drop(file);
+        let result = written.and_then(|()| fs::rename(&temporary, &target));
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        return result.map_err(|error| error.to_string());
+    }
+    Err("could not create an HTTP adapter record".to_owned())
 }
 
 fn is_installed(binary_path: &str) -> bool {
@@ -409,6 +449,113 @@ mod tests {
                 "zed-http-lsp-aarch64-apple-darwin-0.0.9"
             ]
         );
+    }
+
+    #[test]
+    fn records_the_selected_server_per_worktree() {
+        let directory = env::temp_dir().join(format!(
+            "zed-http-record-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        record_server_path(&directory, "/workspace/one", "/abs/path/zed-http-lsp").unwrap();
+        record_server_path(
+            &directory,
+            "/workspace/two",
+            "zed-http-lsp-target-1/zed-http-lsp",
+        )
+        .unwrap();
+        let entries: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(entries.len(), 2);
+        let mut contents: Vec<String> = entries
+            .iter()
+            .map(|entry| fs::read_to_string(entry.path()).unwrap())
+            .collect();
+        contents.sort();
+        assert_eq!(
+            contents,
+            vec![
+                "/workspace/one\n/abs/path/zed-http-lsp\n".to_owned(),
+                "/workspace/two\nzed-http-lsp-target-1/zed-http-lsp\n".to_owned(),
+            ]
+        );
+        assert!(!directory.join("x.tmp").exists());
+
+        record_server_path(&directory, "/workspace/one", "/abs/newer").unwrap();
+        let contents: Vec<String> = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| fs::read_to_string(entry.path()).unwrap())
+            .collect();
+        assert!(contents.contains(&"/workspace/one\n/abs/newer\n".to_owned()));
+        assert!(fs::read_dir(&directory).unwrap().all(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .unwrap()
+            != "tmp"));
+
+        assert!(record_server_path(&directory, "/bad\nroot", "/abs").is_err());
+        assert!(record_server_path(&directory, "/ok", "binary\r\npath").is_err());
+        fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn concurrent_records_never_clobber_each_others_writes() {
+        let directory = env::temp_dir().join(format!(
+            "zed-http-record-race-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let directory = directory.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    record_server_path(&directory, "/shared/root", &format!("/adapter/{index}"))
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let entries: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(entries.len(), 1);
+        let contents = fs::read_to_string(entries[0].path()).unwrap();
+        let binary = contents
+            .strip_prefix("/shared/root\n")
+            .unwrap()
+            .strip_suffix('\n')
+            .unwrap();
+        assert!(
+            (0..8).any(|index| binary == format!("/adapter/{index}")),
+            "{contents}"
+        );
+        assert!(fs::read_dir(&directory).unwrap().all(|entry| entry
+            .unwrap()
+            .path()
+            .extension()
+            .unwrap()
+            != "tmp"));
+
+        record_server_path(&directory, "/other", "/other-adapter").unwrap();
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        fs::remove_dir_all(&directory).ok();
     }
 
     #[test]

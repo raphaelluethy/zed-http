@@ -1,11 +1,113 @@
 #[allow(dead_code)]
 mod common;
 
-use std::fs;
+use std::{
+    fs,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
-use common::{start_server, Workspace};
+use axum::{routing::get, Router};
+use common::{script_engine, start_server, Workspace};
 use serde_json::{json, Value};
-use zed_http_lsp::report::{OutputView, Report};
+use zed_http_lsp::{
+    report::{OutputView, Report},
+    runner::Runner,
+    script::Limits,
+    session::Session,
+};
+
+async fn start_counting_server() -> (SocketAddr, Arc<AtomicUsize>) {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&hits);
+    let app = Router::new().route(
+        "/hit",
+        get(move || {
+            let counted = Arc::clone(&counted);
+            async move {
+                counted.fetch_add(1, Ordering::Relaxed);
+                "hit"
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (address, hits)
+}
+
+#[tokio::test]
+async fn refuses_to_run_files_with_parse_errors() {
+    let (address, hits) = start_counting_server().await;
+    let workspace = Workspace::new(address);
+    let session = Session::new();
+    let runner = Runner::with_scripts(Arc::clone(&session), script_engine(Limits::default()));
+    runner.set_workspace_roots(vec![workspace.root.clone()]);
+
+    for (name, text) in [
+        (
+            "malformed header",
+            "GET {{baseUrl}}/hit\nAuthorization Bearer dummy\n",
+        ),
+        (
+            "invalid directive",
+            "# @timeout nonsense\nGET {{baseUrl}}/hit\n",
+        ),
+        (
+            "unterminated handler",
+            "GET {{baseUrl}}/hit\n\n> {%\nclient.global.set(\"x\", 1);\n",
+        ),
+        ("invalid variable", "@oops\nGET {{baseUrl}}/hit\n"),
+    ] {
+        let path = workspace.write("requests.http", text);
+        let error = runner
+            .run(&path, text, None, Some("test"))
+            .await
+            .expect_err(&format!("{name} should fail"));
+        assert!(error.contains("line"), "{name}: {error}");
+        assert_eq!(hits.load(Ordering::Relaxed), 0, "{name}");
+        assert!(session.globals().is_empty(), "{name}");
+    }
+
+    workspace.write(
+        "bad.http",
+        "### Bad\n# @name bad\nGET {{baseUrl}}/hit\nAuthorization Bearer dummy\n",
+    );
+    for text in ["run ./bad.http\n", "import ./bad.http\n\nrun #bad\n"] {
+        let path = workspace.write("requests.http", text);
+        let report = runner.run(&path, text, None, Some("test")).await.unwrap();
+        assert_eq!(report.summary().failed, 1, "{text}");
+        assert!(
+            report.executions[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("line"),
+            "{text}"
+        );
+        assert_eq!(hits.load(Ordering::Relaxed), 0, "{text}");
+    }
+
+    let text = "< {% client.global.set(\"x\", 1); %}\nGET {{baseUrl}}/hit\n\n###\n\
+                GET {{baseUrl}}/hit\nAuthorization Bearer dummy\n";
+    let path = workspace.write("requests.http", text);
+    let error = runner
+        .run(&path, text, None, Some("test"))
+        .await
+        .expect_err("a later malformed block should fail the whole file");
+    assert!(error.contains("line"), "{error}");
+    assert_eq!(hits.load(Ordering::Relaxed), 0);
+    assert!(session.globals().is_empty());
+
+    runner
+        .run(&path, "GET {{baseUrl}}/hit\n", None, Some("test"))
+        .await
+        .unwrap();
+    assert_eq!(hits.load(Ordering::Relaxed), 1);
+}
 
 fn output(report: &Report) -> String {
     report.render(OutputView::Full)

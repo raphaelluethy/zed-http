@@ -25,6 +25,7 @@ use crate::{
 
 /// Bodies beyond this total are left out of a Send All report to keep response files sane.
 const MAX_REPORT_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_EXECUTIONS: usize = 1000;
 /// Bounds `run ./file.http` nesting and the files searched through `import`.
 const MAX_RUN_DEPTH: usize = 8;
 const MAX_IMPORTED_FILES: usize = 32;
@@ -68,6 +69,34 @@ struct RunState {
     /// Files currently executing through `run ./file.http`, to stop cycles.
     stack: Vec<PathBuf>,
     report: Report,
+    body_bytes: usize,
+    stopped: bool,
+}
+
+impl RunState {
+    fn push_execution(&mut self, execution: Execution) {
+        self.push_execution_within(execution, MAX_REPORT_BODY_BYTES)
+    }
+
+    fn push_execution_within(&mut self, mut execution: Execution, limit: usize) {
+        if let Some(body) = execution.body.as_mut() {
+            let bytes = body
+                .formatted
+                .as_ref()
+                .map_or(0, String::capacity)
+                .saturating_add(body.content.as_ref().map_or(0, crate::report::value_bytes));
+            if bytes > limit.saturating_sub(self.body_bytes) {
+                body.formatted = Some(format!(
+                    "<body omitted: this run exceeded {} MiB of response bodies>",
+                    MAX_REPORT_BODY_BYTES / 1024 / 1024
+                ));
+                body.content = None;
+            } else {
+                self.body_bytes += bytes;
+            }
+        }
+        self.report.executions.push(execution);
+    }
 }
 
 /// Per-run state shared by every block.
@@ -126,27 +155,15 @@ impl Runner {
             environment: configured_environment.map(str::to_owned),
             stack: vec![path.clone()],
             report: Report::default(),
+            body_bytes: 0,
+            stopped: false,
         };
         let frame = load_frame(path, syntax::parse(text), &state)?;
         let steps = select_steps(&frame.document, line)?;
         self.run_steps(&frame, steps, &BTreeMap::new(), &mut state)
             .await;
 
-        let mut report = state.report;
-        let mut body_bytes = 0;
-        for execution in &mut report.executions {
-            if let Some(body) = execution.body.as_mut() {
-                body_bytes += body.formatted.as_ref().map_or(0, String::len);
-                if body_bytes > MAX_REPORT_BODY_BYTES {
-                    body.formatted = Some(format!(
-                        "<body omitted: this run exceeded {} MiB of response bodies>",
-                        MAX_REPORT_BODY_BYTES / 1024 / 1024
-                    ));
-                    body.content = None;
-                }
-            }
-        }
-        Ok(report)
+        Ok(state.report)
     }
 
     fn run_steps<'a>(
@@ -158,10 +175,21 @@ impl Runner {
     ) -> BoxFuture<'a> {
         Box::pin(async move {
             for step in steps {
+                if state.stopped {
+                    break;
+                }
+                if state.report.executions.len() >= MAX_EXECUTIONS {
+                    state.stopped = true;
+                    state.push_execution(Execution {
+                        error: Some(format!("stopped after {MAX_EXECUTIONS} executions")),
+                        ..Execution::default()
+                    });
+                    break;
+                }
                 match step {
                     Step::Block(block) => {
                         let execution = self.execute_in(frame, block, overrides, state).await;
-                        state.report.executions.push(execution);
+                        state.push_execution(execution);
                     }
                     Step::Run(command) => self.run_command(frame, command, overrides, state).await,
                 }
@@ -204,14 +232,14 @@ impl Runner {
             RunTarget::Request(name) => {
                 if let Some(block) = find_named(&frame.document, name) {
                     let execution = self.execute_in(frame, block, &overrides, state).await;
-                    state.report.executions.push(execution);
+                    state.push_execution(execution);
                     return;
                 }
                 match find_imported(frame, name, state) {
                     Ok(Some((imported, index))) => {
                         let block = &imported.document.blocks[index];
                         let execution = self.execute_in(&imported, block, &overrides, state).await;
-                        state.report.executions.push(execution);
+                        state.push_execution(execution);
                         return;
                     }
                     Ok(None) => format!("no request named {name:?} in this file or its imports"),
@@ -247,7 +275,7 @@ impl Runner {
             RunTarget::Request(name) => format!("#{name}"),
             RunTarget::File(path) => path.clone(),
         };
-        state.report.executions.push(Execution {
+        state.push_execution(Execution {
             block_name: format!("run {target}"),
             error: Some(failure),
             ..Execution::default()
@@ -370,14 +398,18 @@ impl Runner {
         }
 
         if let Some(name) = &block.name {
-            self.session.store_response(
+            if let Err(error) = self.session.store_response(
                 name,
                 NamedResponse {
                     status: response.status,
                     headers: response.headers.clone(),
                     body: body_value,
                 },
-            );
+            ) {
+                execution
+                    .warnings
+                    .push(format!("response was not retained: {error}"));
+            }
         }
         execution
     }
@@ -406,7 +438,7 @@ impl Runner {
     /// Applies globals and moves output into the console. Returns the script error, if any;
     /// effects made before the error are still applied.
     fn apply_effects(&self, effects: ScriptEffects, execution: &mut Execution) -> Option<String> {
-        self.session.apply_globals(&effects.globals);
+        let globals_error = self.session.apply_globals(&effects.globals).err();
         let console = &mut execution.script_console;
         for log in effects.logs {
             console.push(ScriptConsoleEntry::log(log.level, log.message));
@@ -421,7 +453,10 @@ impl Runner {
         if let Some(error) = &effects.error {
             console.push(ScriptConsoleEntry::log("error", error.clone()));
         }
-        effects.error
+        if let Some(error) = &globals_error {
+            console.push(ScriptConsoleEntry::log("error", error.clone()));
+        }
+        effects.error.or(globals_error)
     }
 }
 
@@ -550,10 +585,20 @@ fn read_document(path: &Path) -> Result<Document, String> {
     }
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    Ok(syntax::parse(&text))
+    let document = syntax::parse(&text);
+    validate_document(path, &document)?;
+    Ok(document)
+}
+
+fn validate_document(path: &Path, document: &Document) -> Result<(), String> {
+    match document.error_summary() {
+        Some(error) => Err(format!("cannot execute {}: {error}", path.display())),
+        None => Ok(()),
+    }
 }
 
 fn load_frame(path: PathBuf, document: Document, state: &RunState) -> Result<FileFrame, String> {
+    validate_document(&path, &document)?;
     let environment =
         variables::load_environment(&path, &state.workspace_roots, state.environment.as_deref())?;
     let file_vars = document
@@ -682,7 +727,10 @@ pub fn format_body(body: &[u8], content_type: Option<&str>) -> (Option<String>, 
     let text = decode_text(body, content_type);
     if content_type.is_some_and(is_json) {
         if let Some(Ok(value)) = text.as_deref().map(serde_json::from_str::<Value>) {
-            let formatted = serde_json::to_string_pretty(&value).ok();
+            let formatted = match crate::report::pretty_json(&value, protocol::MAX_BODY_BYTES) {
+                Ok(formatted) => Some(formatted),
+                Err(_) => Some("<JSON display omitted: formatted body exceeds 32 MiB>".to_owned()),
+            };
             return (formatted, Some(value));
         }
     }
@@ -732,6 +780,80 @@ mod tests {
 
     use super::*;
     use crate::protocol::PreparedBody;
+
+    fn run_state() -> RunState {
+        RunState {
+            workspace_roots: Vec::new(),
+            environment: None,
+            stack: Vec::new(),
+            report: Report::default(),
+            body_bytes: 0,
+            stopped: false,
+        }
+    }
+
+    #[test]
+    fn charges_bodies_against_the_report_budget_on_push() {
+        let mut state = run_state();
+        let execution = |body: Body| Execution {
+            body: Some(body),
+            ..Execution::default()
+        };
+        let big = "x".repeat(600);
+        state.push_execution_within(
+            execution(Body {
+                formatted: Some(big.clone()),
+                content: None,
+            }),
+            1024,
+        );
+        assert_eq!(state.body_bytes, big.capacity());
+        assert_eq!(
+            state.report.executions[0]
+                .body
+                .as_ref()
+                .unwrap()
+                .formatted
+                .as_deref(),
+            Some(big.as_str())
+        );
+
+        let content = json!("y".repeat(600));
+        state.push_execution_within(
+            execution(Body {
+                formatted: None,
+                content: Some(content),
+            }),
+            1024,
+        );
+        let body = state.report.executions[1].body.as_ref().unwrap();
+        assert_eq!(
+            body.formatted.as_deref(),
+            Some("<body omitted: this run exceeded 64 MiB of response bodies>")
+        );
+        assert!(body.content.is_none());
+    }
+
+    #[tokio::test]
+    async fn stops_runs_at_the_execution_limit() {
+        let runner = Runner::new(Session::new());
+        let frame = FileFrame {
+            path: PathBuf::from("requests.http"),
+            document: syntax::parse("GET http://x\n"),
+            environment: Environment::default(),
+            file_vars: BTreeMap::new(),
+        };
+        let mut state = run_state();
+        state.report.executions = vec![Execution::default(); MAX_EXECUTIONS];
+        let steps = select_steps(&frame.document, None).unwrap();
+        runner
+            .run_steps(&frame, steps, &BTreeMap::new(), &mut state)
+            .await;
+        assert_eq!(state.report.executions.len(), MAX_EXECUTIONS + 1);
+        let failure = &state.report.executions[MAX_EXECUTIONS];
+        assert!(failure.error.as_deref().unwrap().contains("stopped after"));
+        assert!(failure.request.is_none());
+    }
 
     #[test]
     fn formats_json_text_and_binary_bodies() {

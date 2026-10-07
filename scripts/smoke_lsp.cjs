@@ -238,7 +238,7 @@ async function main() {
             return;
         }
         if (request.url === "/prepared") {
-            response.end(JSON.stringify({ prepared: true }));
+            response.end(JSON.stringify({ prepared: true, token: "native-runner-token" }));
             return;
         }
         const authorized = request.headers.authorization === "Bearer native-runner-token";
@@ -267,7 +267,10 @@ async function main() {
             "%}",
             "GET {{baseUrl}}/{{dynamicPath}}",
             "",
-            '> {% client.global.set("sessionToken", "native-runner-token"); %}',
+            '> {%',
+            'client.test("login returns a token", () => client.assert(response.status === 200 && response.body.token));',
+            'client.global.set("sessionToken", response.body.token);',
+            '%}',
             "",
             "### Verify the session",
             "GET {{baseUrl}}/verify",
@@ -315,6 +318,7 @@ async function main() {
         });
         assert.ok(initialized.capabilities.completionProvider, JSON.stringify(initialized));
         assert.ok(initialized.capabilities.hoverProvider, JSON.stringify(initialized));
+        assert.ok(initialized.capabilities.foldingRangeProvider, JSON.stringify(initialized));
         assert.equal(initialized.capabilities.codeLensProvider, undefined);
         client.notify("initialized", {});
         client.notify("textDocument/didOpen", {
@@ -326,6 +330,15 @@ async function main() {
             (params) => params.uri === uri,
         );
         assert.equal(diagnostics.diagnostics.length, 0, JSON.stringify(diagnostics));
+
+        const folds = await client.request("textDocument/foldingRange", { textDocument: { uri } });
+        const handlerLine = source.split("\n").indexOf('> {%');
+        assert.ok(folds.some((fold) => fold.startLine === handlerLine && fold.endLine === handlerLine + 3));
+        const scriptCompletion = await client.request("textDocument/completion", {
+            textDocument: { uri },
+            position: { line: handlerLine + 2, character: "client.global.".length },
+        });
+        assert.ok(scriptCompletion.some((item) => item.label === "set"));
 
         // Completion inside `{{` offers env, script-set and dynamic variables.
         const envLine = source.split("\n").findIndex((line) => line.startsWith("X-Env:"));
@@ -362,6 +375,7 @@ async function main() {
         assert.equal(prepared.status, 0, prepared.stderr);
         assert.equal(prepared.stderr, "", "the run was not forwarded to the language server");
         assert.match(prepared.stdout, /200 OK/);
+        assert.match(prepared.stdout, /login returns a token/);
         assert.match(prepared.stdout, /"prepared": true/);
         assert.equal(seen.at(-1).url, "/prepared");
 
@@ -370,6 +384,10 @@ async function main() {
         assert.equal(verified.status, 0, verified.stdout + verified.stderr);
         assert.match(verified.stdout, /"authorized": true/);
         assert.equal(seen.at(-1).authorization, "Bearer native-runner-token");
+        // Run All must carry the JSON response token forward in the same way.
+        const all = await runTask(temporary, requestPath);
+        assert.equal(all.status, 0, all.stdout + all.stderr);
+        assert.match(all.stdout, /"authorized": true/);
         // Hover reads the same in-memory session.
         assert.match((await hoverAt("Authorization: Bearer ")).contents.value, /client\.global/);
 
@@ -384,8 +402,120 @@ async function main() {
         assert.match(websocket.stdout, /← echo: hello native-runner-token/);
         assert.equal(seen.at(-1).url, "/socket");
 
-        await client.stop();
-        client = undefined;
+        const envFile = path.join(temporary, "http-client.env.json");
+        const envBackup = fs.readFileSync(envFile);
+        try {
+            fs.writeFileSync(envFile, "{not json\n");
+            const logWarning = client.waitForNotification(
+                "window/logMessage",
+                (params) => /not valid JSON/.test(params.message ?? ""),
+            );
+            await client.request("textDocument/hover", {
+                textDocument: { uri },
+                position: { line: envLine, character: "X-Env: {{".length },
+            });
+            await logWarning;
+        } finally {
+            fs.writeFileSync(envFile, envBackup);
+        }
+
+        const follower = new LspClient(lspPath, {
+            cwd: temporary,
+            env: { ...process.env, ZED_HTTP_ENV: "smoke" },
+        });
+        try {
+            await follower.request("initialize", {
+                processId: process.pid,
+                capabilities: {},
+                rootUri: pathToFileURL(temporary).href,
+            });
+            follower.notify("initialized", {});
+            follower.notify("textDocument/didOpen", {
+                textDocument: { uri, languageId: "http", version: 1, text: source },
+            });
+            await follower.waitForNotification(
+                "textDocument/publishDiagnostics",
+                (params) => params.uri === uri,
+            );
+
+            const followerHover = await follower.request("textDocument/hover", {
+                textDocument: { uri },
+                position: {
+                    line: row("Authorization: Bearer ") - 1,
+                    character: "Authorization: Bearer ".length + 3,
+                },
+            });
+            assert.match(followerHover.contents.value, /client\.global/);
+            assert.match(followerHover.contents.value, /native-runner-token/);
+            const followerCompletion = await follower.request("textDocument/completion", {
+                textDocument: { uri },
+                position: { line: envLine, character: "X-Env: {{".length },
+            });
+            assert.ok(
+                followerCompletion.some((item) => item.label === "sessionToken"),
+                "follower should see the owner's globals",
+            );
+
+            const edited = source.replace("X-Env: {{smokeToken}}", "X-Env: {{sessionToken}}");
+            follower.notify("textDocument/didChange", {
+                textDocument: { uri, version: 2 },
+                contentChanges: [{ text: edited }],
+            });
+            const editedHover = await follower.request("textDocument/hover", {
+                textDocument: { uri },
+                position: { line: envLine, character: "X-Env: {{".length + 3 },
+            });
+            assert.match(editedHover.contents.value, /native-runner-token/);
+            assert.match((await hoverAt("X-Env: ")).contents.value, /environment `smoke`/);
+
+            await client.stop();
+            client = undefined;
+            let takeover;
+            for (let attempt = 0; attempt < 50; attempt += 1) {
+                takeover = await runTask(temporary, requestPath, row("GET {{baseUrl}}/{{dynamicPath}}"));
+                if (takeover.stderr === "") break;
+                await new Promise((resolve) => setTimeout(resolve, 100));
+            }
+            assert.equal(takeover.status, 0, takeover.stdout + takeover.stderr);
+            assert.equal(takeover.stderr, "", "the run was not forwarded after the takeover");
+
+            const markerPath = path.join(temporary, "marker.http");
+            const markerSource = [
+                "GET {{baseUrl}}/prepared",
+                "> {%",
+                'client.global.set("takeoverMark", "second-owner");',
+                "%}",
+                "",
+                "### Use the mark",
+                "GET {{baseUrl}}/verify",
+                "X-Mark: {{takeoverMark}}",
+                "",
+            ].join("\n");
+            fs.writeFileSync(markerPath, markerSource);
+            const markerUri = pathToFileURL(markerPath).href;
+            follower.notify("textDocument/didOpen", {
+                textDocument: { uri: markerUri, languageId: "http", version: 1, text: markerSource },
+            });
+            const marked = await runTask(temporary, markerPath, 1);
+            assert.equal(marked.status, 0, marked.stdout + marked.stderr);
+            assert.equal(marked.stderr, "", "the follow-up run was not forwarded");
+            const markHover = await follower.request("textDocument/hover", {
+                textDocument: { uri: markerUri },
+                position: {
+                    line: markerSource.split("\n").findIndex((line) => line.startsWith("X-Mark: ")),
+                    character: "X-Mark: {{".length + 2,
+                },
+            });
+            assert.match(markHover.contents.value, /second-owner/);
+
+            await follower.stop();
+            const alone = await runTask(temporary, requestPath);
+            assert.equal(alone.status, 0, alone.stdout + alone.stderr);
+            assert.match(alone.stdout, /"authorized": true/);
+            assert.notEqual(alone.stderr, "", "expected the standalone fallback warning");
+        } finally {
+            if (!follower.exited) follower.child.kill();
+        }
         console.log("Smoke test passed: completion, hover and diagnostics work, and gutter runs share the language server's session.");
     } finally {
         if (client) client.child.kill();

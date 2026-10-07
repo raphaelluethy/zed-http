@@ -10,13 +10,14 @@ use std::{
 use serde_json::Value;
 use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionTextEdit, Diagnostic, DiagnosticSeverity,
-    Documentation, Hover, HoverContents, MarkupContent, MarkupKind, Position, Range, TextEdit,
+    Documentation, FoldingRange, FoldingRangeKind, Hover, HoverContents, MarkupContent, MarkupKind,
+    Position, Range, TextEdit,
 };
 
 use crate::{
     report::value_text,
     session::NamedResponse,
-    syntax::{self, Document, LineContext},
+    syntax::{Document, LineContext, Script},
     variables::Variables,
 };
 
@@ -128,6 +129,85 @@ const MEDIA_TYPES: &[&str] = &[
     "text/csv",
 ];
 
+// Only advertise APIs implemented by script_prelude.js. These are HTTP-client helpers,
+// not a replacement for a JavaScript language server.
+const SCRIPT_MEMBERS: &[(&str, &str)] = &[
+    ("client.global.set", "set(name, value): Save a value for subsequent requests in this workspace session. Use {{name}} in a request."),
+    ("client.global.get", "get(name): Read a session global; returns null when absent."),
+    ("client.global.clear", "clear(name): Remove a session global."),
+    ("client.global.clearAll", "clearAll(): Remove all session globals."),
+    ("client.global.isEmpty", "isEmpty(): Whether the session has no globals."),
+    ("client.test", "test(name, callback): Queue a test to run after the script. Results appear in the terminal."),
+    ("client.assert", "assert(condition, message): Fail the test or script if the condition is false."),
+    ("client.log", "log(...values): Print values in the request's script output."),
+    ("client.exit", "exit(): Stop the current script."),
+    ("request.variables.set", "set(name, value): Set a variable for this request. Pre-request values are substituted before sending."),
+    ("request.variables.get", "get(name): Read a request variable."),
+    ("request.environment.get", "get(name): Read a variable from the selected environment."),
+    ("request.headers.all", "all(): List request headers as name/value objects."),
+    ("request.headers.findByName", "findByName(name): Find a request header, ignoring case."),
+    ("request.method", "The request method."),
+    ("request.url", "The request URL."),
+    ("response.status", "The numeric HTTP response status, for example 200 or 401."),
+    ("response.body", "The response body: a parsed value for JSON responses, otherwise text."),
+    ("response.headers.valueOf", "valueOf(name): Read the first response header with this name, ignoring case."),
+    ("response.headers.valuesOf", "valuesOf(name): Read all response headers with this name, ignoring case."),
+    ("response.contentType.mimeType", "The response media type, without charset parameters."),
+    ("response.contentType.charset", "The charset parameter of the response Content-Type, or null."),
+];
+
+fn header_documentation(name: &str) -> Option<&'static str> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "authorization" => "Credentials for the server. Use `Bearer {{token}}` to send a token saved by a sign-in response handler with `client.global.set(\"token\", response.body.token)`. Basic authentication takes a base64-encoded `username:password` value.",
+        "content-type" => "The media type of the request body, for example `application/json`. Separate headers from the body with a blank line.",
+        "accept" => "The response media types the client accepts, for example `application/json` or `*/*`.",
+        "cookie" => "Cookies sent to the server, separated by semicolons: `name=value; other=value`.",
+        "content-length" => "The request body size in bytes. Usually omit this header: the HTTP runner computes it from the body.",
+        "accept-encoding" => "Accepted response compression formats. The runner supports gzip, deflate, Brotli and Zstandard decompression.",
+        "cache-control" => "Caching directives such as `no-cache`, `no-store` or `max-age=0`.",
+        "host" => "The destination host and optional port. Normally derived from the request URL.",
+        "user-agent" => "Identifies the client sending this request.",
+        _ => return None,
+    })
+}
+
+/// Fold each request and its inline scripts without swallowing the next separator.
+pub fn folding_ranges(text: &str, document: &Document) -> Vec<FoldingRange> {
+    let lines: Vec<_> = text.lines().collect();
+    let mut ranges = Vec::new();
+    let mut push = |start: u32, end: u32| {
+        if end > start {
+            ranges.push(FoldingRange {
+                start_line: start,
+                start_character: None,
+                end_line: end,
+                end_character: None,
+                kind: Some(FoldingRangeKind::Region),
+                collapsed_text: None,
+            });
+        }
+    };
+    for block in &document.blocks {
+        let end = (block.start_line..=block.last_line)
+            .rev()
+            .find(|line| {
+                lines
+                    .get(*line as usize)
+                    .is_some_and(|line| !line.trim().is_empty())
+            })
+            .unwrap_or(block.start_line);
+        push(block.start_line, end);
+        for script in block.pre_scripts.iter().chain(&block.handlers) {
+            if let Script::Inline { line, end_line, .. } = script {
+                push(*line, *end_line);
+            }
+        }
+    }
+    ranges.sort_by_key(|range| (range.start_line, range.end_line));
+    ranges.dedup_by_key(|range| (range.start_line, range.end_line));
+    ranges
+}
+
 const DYNAMIC_VARIABLES: &[(&str, &str)] = &[
     ("$uuid", "A random UUID v4"),
     ("$random.uuid", "A random UUID v4"),
@@ -177,12 +257,15 @@ pub struct Known {
     pub responses: HashMap<String, Arc<NamedResponse>>,
 }
 
-pub fn diagnostics(document: &Document, text: &str) -> Vec<Diagnostic> {
+pub fn diagnostics(document: &Document, _text: &str) -> Vec<Diagnostic> {
     document
         .errors
         .iter()
         .map(|error| Diagnostic {
-            range: line_range(text, error.line),
+            range: Range::new(
+                Position::new(error.line, 0),
+                Position::new(error.line, document.line_utf16_len(error.line)),
+            ),
             severity: Some(DiagnosticSeverity::ERROR),
             source: Some("zed-http".to_owned()),
             message: error.message.clone(),
@@ -197,7 +280,7 @@ pub fn complete(
     position: Position,
     known: &Known,
 ) -> Vec<CompletionItem> {
-    let Some(line) = text.lines().nth(position.line as usize) else {
+    let Some(line) = document.line(text, position.line) else {
         return Vec::new();
     };
     let cursor = byte_offset(line, position.character);
@@ -211,7 +294,11 @@ pub fn complete(
         return variable_items(document, text, &prefix[start..], known, range_from(start));
     }
 
-    match syntax::line_context(text, position.line) {
+    if inline_script_prefix(prefix).is_some() {
+        return script_items(prefix, position.line);
+    }
+
+    match document.line_context(position.line) {
         LineContext::Preamble => {
             let indent = prefix.len() - prefix.trim_start().len();
             let typed = &prefix[indent..];
@@ -239,16 +326,20 @@ pub fn complete(
             }
             Vec::new()
         }
-        LineContext::Body | LineContext::Script => Vec::new(),
+        LineContext::Script => script_items(prefix, position.line),
+        LineContext::Body => Vec::new(),
     }
 }
 
 pub fn hover(text: &str, document: &Document, position: Position, known: &Known) -> Option<Hover> {
-    let line = text.lines().nth(position.line as usize)?;
+    let line = document.line(text, position.line)?;
     let cursor = byte_offset(line, position.character);
-    let (start, end) = variable_spans(line)
+    let variable = variable_spans(line)
         .into_iter()
-        .find(|(start, end)| (*start..=*end).contains(&cursor))?;
+        .find(|(start, end)| (*start..=*end).contains(&cursor));
+    let Some((start, end)) = variable else {
+        return documentation_hover(document, position, line, cursor);
+    };
     let name = line[start + 2..end - 2].trim();
     if name.is_empty() {
         return None;
@@ -258,6 +349,135 @@ pub fn hover(text: &str, document: &Document, position: Position, known: &Known)
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
             value: markdown,
+        }),
+        range: Some(Range::new(
+            Position::new(position.line, utf16_len(&line[..start])),
+            Position::new(position.line, utf16_len(&line[..end])),
+        )),
+    })
+}
+
+fn script_items(prefix: &str, line: u32) -> Vec<CompletionItem> {
+    let start = member_start(prefix);
+    let typed = &prefix[start..];
+    let Some((object, _)) = typed.rsplit_once('.') else {
+        return Vec::new();
+    };
+    let member_start = start + object.len() + 1;
+    let range = Range::new(
+        Position::new(line, utf16_len(&prefix[..member_start])),
+        Position::new(line, utf16_len(prefix)),
+    );
+    let mut members = BTreeMap::new();
+    for (path, documentation) in SCRIPT_MEMBERS {
+        let Some(member) = path
+            .strip_prefix(object)
+            .and_then(|suffix| suffix.strip_prefix('.'))
+        else {
+            continue;
+        };
+        let name = member.split('.').next().unwrap();
+        let nested = member.contains('.');
+        members.entry(name).or_insert_with(|| {
+            item(
+                name,
+                name,
+                if nested || !documentation.contains('(') {
+                    CompletionItemKind::PROPERTY
+                } else {
+                    CompletionItemKind::METHOD
+                },
+                None,
+                Some(if nested {
+                    format!("HTTP Client {object}.{name}")
+                } else {
+                    (*documentation).to_owned()
+                }),
+                0,
+                range,
+            )
+        });
+    }
+    members.into_values().collect()
+}
+
+fn member_boundary(c: char) -> bool {
+    !c.is_alphanumeric() && c != '_' && c != '.' && c != '$'
+}
+
+fn member_start(prefix: &str) -> usize {
+    prefix
+        .char_indices()
+        .rev()
+        .find(|(_, c)| member_boundary(*c))
+        .map_or(0, |(index, c)| index + c.len_utf8())
+}
+
+fn inline_script_prefix(prefix: &str) -> Option<&str> {
+    let rest = prefix
+        .trim_start()
+        .strip_prefix(['<', '>'])?
+        .trim_start()
+        .strip_prefix("{%")?;
+    (!rest.contains("%}")).then_some(rest)
+}
+
+fn documentation_hover(
+    document: &Document,
+    position: Position,
+    line: &str,
+    cursor: usize,
+) -> Option<Hover> {
+    let context = if inline_script_prefix(&line[..cursor]).is_some() {
+        LineContext::Script
+    } else {
+        document.line_context(position.line)
+    };
+    let (start, end, description) = match context {
+        LineContext::Headers => {
+            let (name, _) = line.split_once(':')?;
+            if cursor > name.len() {
+                return None;
+            }
+            (0, name.len(), header_documentation(name)?)
+        }
+        LineContext::Preamble => {
+            let indent = line.len() - line.trim_start().len();
+            let trimmed = line.trim_start();
+            let rest = trimmed
+                .strip_prefix("//")
+                .or_else(|| trimmed.strip_prefix('#'))?;
+            let name = rest.trim_start().strip_prefix('@')?;
+            let start = indent + trimmed.len() - name.len();
+            let end = start
+                + line[start..]
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+                    .unwrap_or(line.len() - start);
+            if cursor < start.saturating_sub(1) || cursor > end {
+                return None;
+            }
+            let (_, _, description) = DIRECTIVES
+                .iter()
+                .find(|(name, _, _)| *name == &line[start..end])?;
+            (start, end, *description)
+        }
+        LineContext::Script => {
+            let start = member_start(&line[..cursor]);
+            let end = cursor
+                + line[cursor..]
+                    .find(member_boundary)
+                    .unwrap_or(line.len() - cursor);
+            let (_, description) = SCRIPT_MEMBERS
+                .iter()
+                .find(|(name, _)| *name == &line[start..end])?;
+            (start, end, *description)
+        }
+        LineContext::Body => return None,
+    };
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: format!("**{}**\n\n{description}", &line[start..end]),
         }),
         range: Some(Range::new(
             Position::new(position.line, utf16_len(&line[..start])),
@@ -380,13 +600,22 @@ fn variable_items(
         return items;
     }
 
+    for (name, value) in &known.globals {
+        push(
+            name.clone(),
+            CompletionItemKind::VARIABLE,
+            "client.global".into(),
+            Some(code_block(&value_text(value))),
+            0,
+        );
+    }
     for (name, value) in file_variables(document) {
         push(
             name,
             CompletionItemKind::VARIABLE,
             "file variable".into(),
             Some(code_block(&value)),
-            0,
+            1,
         );
     }
     let environment = match &known.environment_name {
@@ -399,15 +628,6 @@ fn variable_items(
             CompletionItemKind::VARIABLE,
             environment.clone(),
             Some(code_block(value)),
-            1,
-        );
-    }
-    for (name, value) in &known.globals {
-        push(
-            name.clone(),
-            CompletionItemKind::VARIABLE,
-            "client.global".into(),
-            Some(code_block(&value_text(value))),
             2,
         );
     }
@@ -518,7 +738,7 @@ fn header_items(range: Range) -> Vec<CompletionItem> {
                 &format!("{header}: "),
                 CompletionItemKind::PROPERTY,
                 None,
-                None,
+                header_documentation(header).map(str::to_owned),
                 0,
                 range,
             )
@@ -668,11 +888,6 @@ fn variable_spans(line: &str) -> Vec<(usize, usize)> {
     spans
 }
 
-fn line_range(text: &str, line: u32) -> Range {
-    let length = text.lines().nth(line as usize).map_or(0, utf16_len);
-    Range::new(Position::new(line, 0), Position::new(line, length))
-}
-
 fn utf16_len(text: &str) -> u32 {
     text.encode_utf16().count() as u32
 }
@@ -713,6 +928,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::syntax;
 
     const TEXT: &str = "@baseUrl = http://localhost:8080\n\n### Login\n# @name login\nPOST {{baseUrl}}/api/login\nContent-Type: application/json\n\n{}\n> {%\nclient.global.set(\"token\", response.body.token);\n%}\n\n###\nGET {{baseUrl}}/api\nAuthorization: Bearer {{tok\n";
 
@@ -806,6 +1022,54 @@ mod tests {
     }
 
     #[test]
+    fn globals_win_over_file_variables_and_environment() {
+        let mut known = known();
+        known
+            .environment
+            .insert("token".to_owned(), "env-token".to_owned());
+        known
+            .globals
+            .insert("token".to_owned(), json!("global-token"));
+        let text = "@token = file-token\nGET https://example.test\nAuthorization: Bearer {{tok\n";
+        let items = complete(text, end_of(text, 2), &known);
+        let tokens: Vec<_> = items.iter().filter(|item| item.label == "token").collect();
+        assert_eq!(tokens.len(), 1, "{items:?}");
+        assert_eq!(tokens[0].detail.as_deref(), Some("client.global"));
+        let Some(Documentation::MarkupContent(docs)) = &tokens[0].documentation else {
+            panic!("expected documentation");
+        };
+        assert!(docs.value.contains("global-token"), "{}", docs.value);
+
+        let text =
+            "@token = file-token\nGET https://example.test\nAuthorization: Bearer {{token}}\n";
+        let HoverContents::Markup(markup) =
+            hover(text, Position::new(2, 26), &known).unwrap().contents
+        else {
+            panic!("expected markdown");
+        };
+        assert!(markup.value.contains("`client.global`"), "{}", markup.value);
+        assert!(markup.value.contains("global-token"), "{}", markup.value);
+
+        let variables = Variables {
+            globals: known.globals.clone(),
+            file: file_variables(&syntax::parse(text)),
+            environment: known.environment.clone(),
+            ..Variables::default()
+        };
+        assert_eq!(variables.substitute("{{token}}").text, "global-token");
+
+        let known = Known {
+            globals: BTreeMap::new(),
+            ..known
+        };
+        let text = "@token = file-token\nGET https://example.test\nAuthorization: Bearer {{tok\n";
+        let items = complete(text, end_of(text, 2), &known);
+        let tokens: Vec<_> = items.iter().filter(|item| item.label == "token").collect();
+        assert_eq!(tokens.len(), 1, "{items:?}");
+        assert_eq!(tokens[0].detail.as_deref(), Some("file variable"));
+    }
+
+    #[test]
     fn hovers_show_the_winning_value_and_its_source() {
         let mut known = known();
         known
@@ -847,5 +1111,69 @@ mod tests {
         assert_eq!(byte_offset("ä{{x", 1), 2);
         assert_eq!(byte_offset("😀x", 2), 4);
         assert_eq!(byte_offset("ab", 9), 2);
+    }
+
+    #[test]
+    fn documents_headers_directives_and_script_helpers_in_context() {
+        for (text, position, expected) in [
+            ("GET https://example.test\nAuthorization: Bearer {{token}}\n", Position::new(1, 4), "sign-in response handler"),
+            ("# @timeout 10s\nGET https://example.test\n", Position::new(0, 5), "Inactivity timeout"),
+            ("GET https://example.test\n> {%\nclient.global.set('token', response.body.token);\n%}\n", Position::new(2, 9), "subsequent requests"),
+            ("GET https://example.test\n> {% client.global.set('token', response.body.token); %}\n", Position::new(1, 12), "subsequent requests"),
+        ] {
+            let result = hover(text, position, &Known::default()).unwrap();
+            let HoverContents::Markup(markup) = result.contents else { panic!("expected markup") };
+            assert!(markup.value.contains(expected), "{}", markup.value);
+        }
+        let text = "POST https://example.test\n\nAuthorization: body text\n";
+        assert!(hover(text, Position::new(2, 3), &Known::default()).is_none());
+    }
+
+    #[test]
+    fn completes_script_members_with_utf16_edits() {
+        for (text, row, expected) in [
+            (
+                "GET https://example.test\n> {%\nclient.global.se\n%}\n",
+                2,
+                "set",
+            ),
+            (
+                "GET https://example.test\n> {% response.st %}\n",
+                1,
+                "status",
+            ),
+            (
+                "< {% request.variables.se %}\nGET https://example.test\n",
+                0,
+                "set",
+            ),
+        ] {
+            let line = text.lines().nth(row).unwrap();
+            let prefix = line.split(" %}").next().unwrap();
+            let position = Position::new(row as u32, utf16_len(prefix));
+            let items = complete(text, position, &Known::default());
+            assert!(labels(&items).contains(&expected), "{items:?}");
+        }
+        let items = script_items("😀client.global.se", 0);
+        let set = items.iter().find(|item| item.label == "set").unwrap();
+        let Some(CompletionTextEdit::Edit(edit)) = &set.text_edit else {
+            panic!("expected edit")
+        };
+        assert_eq!(
+            edit.range,
+            Range::new(Position::new(0, 16), Position::new(0, 18))
+        );
+        assert_eq!(edit.new_text, "set");
+    }
+
+    #[test]
+    fn folds_requests_and_scripts_using_parser_boundaries() {
+        let text = "### Login\nGET https://example.test\n> {%\n\nclient.log('%}');\n\n%}\n\n### Next\nGET https://example.test\n";
+        let ranges = folding_ranges(text, &syntax::parse(text));
+        let lines: Vec<_> = ranges
+            .iter()
+            .map(|range| (range.start_line, range.end_line))
+            .collect();
+        assert_eq!(lines, [(1, 6), (2, 6)]);
     }
 }

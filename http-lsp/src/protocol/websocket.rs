@@ -64,7 +64,13 @@ fn parse_frames(body: &str) -> (Vec<Frame>, usize) {
     };
     for line in body.lines() {
         let trimmed = line.trim();
-        match trimmed.strip_prefix("===").map(str::trim) {
+        let separator = trimmed.strip_prefix("===").map(str::trim);
+        let separator = separator.map(|rest| {
+            rest.split_once("//")
+                .map_or(rest, |(before, _)| before)
+                .trim()
+        });
+        match separator {
             Some("") => flush(&mut lines, &mut waits),
             Some("wait-for-server") => {
                 flush(&mut lines, &mut waits);
@@ -436,6 +442,52 @@ mod tests {
             )
         );
         assert_eq!(parse_frames(""), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn separator_comments_are_ignored_but_messages_keep_slashes() {
+        let body = "=== // first\ndelay\n=== wait-for-server // hold\nhttps://example.test/a//b\n\
+                    {\"u\": \"a//b\"}\n=== custom // note\nkept\n===\nlast // one\n";
+        let (frames, trailing) = parse_frames(body);
+        assert_eq!(
+            frames,
+            vec![
+                Frame {
+                    waits: 0,
+                    text: "delay".to_owned()
+                },
+                Frame {
+                    waits: 1,
+                    text: "https://example.test/a//b\n{\"u\": \"a//b\"}\n=== custom // note\nkept"
+                        .to_owned()
+                },
+                Frame {
+                    waits: 0,
+                    text: "last // one".to_owned()
+                },
+            ]
+        );
+        assert_eq!(trailing, 0);
+        assert_eq!(
+            parse_frames("a\n===wait-for-server\nb"),
+            (
+                vec![
+                    Frame {
+                        waits: 0,
+                        text: "a".to_owned()
+                    },
+                    Frame {
+                        waits: 1,
+                        text: "b".to_owned()
+                    },
+                ],
+                0
+            )
+        );
+        assert_eq!(
+            parse_frames("x\n=== wait-for-server // a\n=== wait-for-server // b\ny").0[1].waits,
+            2
+        );
     }
 
     #[test]

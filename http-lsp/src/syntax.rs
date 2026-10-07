@@ -10,6 +10,7 @@ pub struct Document {
     pub imports: Vec<Import>,
     pub runs: Vec<RunCommand>,
     pub errors: Vec<ParseError>,
+    pub lines: Vec<LineInfo>,
 }
 
 impl Document {
@@ -30,6 +31,31 @@ impl Document {
     pub fn block_at(&self, line: u32) -> Option<&RequestBlock> {
         self.blocks.iter().find(|block| block.contains(line))
     }
+
+    pub fn line<'a>(&self, text: &'a str, line: u32) -> Option<&'a str> {
+        let info = self.lines.get(line as usize)?;
+        text.get(info.start..info.end)
+    }
+
+    pub fn line_context(&self, line: u32) -> LineContext {
+        self.lines
+            .get(line as usize)
+            .map_or(LineContext::Preamble, |info| info.context)
+    }
+
+    pub fn line_utf16_len(&self, line: u32) -> u32 {
+        self.lines
+            .get(line as usize)
+            .map_or(0, |info| info.utf16_len)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct LineInfo {
+    pub start: usize,
+    pub end: usize,
+    pub utf16_len: u32,
+    pub context: LineContext,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,8 +173,15 @@ pub enum BodyPart {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Script {
-    Inline { line: u32, source: String },
-    File { line: u32, path: String },
+    Inline {
+        line: u32,
+        end_line: u32,
+        source: String,
+    },
+    File {
+        line: u32,
+        path: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,16 +199,45 @@ pub fn find_header<'a>(headers: &'a [Header], name: &str) -> Option<&'a str> {
 }
 
 pub fn parse(text: &str) -> Document {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut parser = Parser::default();
-    for (index, line) in text.lines().enumerate() {
-        parser.line(index as u32, line);
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    for (index, chunk) in text.split_inclusive('\n').enumerate() {
+        let next = offset + chunk.len();
+        let line = match chunk.strip_suffix('\n') {
+            Some(line) => line.strip_suffix('\r').unwrap_or(line),
+            None => chunk,
+        };
+        let context = parser.context();
+        lines.push(LineInfo {
+            start: offset,
+            end: offset + line.len(),
+            utf16_len: line.encode_utf16().count() as u32,
+            context,
+        });
+        let parsed = if index == 0 {
+            line.strip_prefix('\u{feff}').unwrap_or(line)
+        } else {
+            line
+        };
+        parser.line(index as u32, parsed);
+        offset = next;
     }
     // `lines()` drops a trailing empty line, but the cursor can sit there; the last block
     // extends to it.
+    if text.is_empty() || text.ends_with('\n') {
+        lines.push(LineInfo {
+            start: offset,
+            end: offset,
+            utf16_len: 0,
+            context: parser.context(),
+        });
+    }
     let line_count = text.matches('\n').count() as u32;
     parser.last_line = parser.last_line.max(line_count);
-    parser.finish()
+    let mut document = parser.finish();
+    document.lines = lines;
+    document
 }
 
 /// Where a line sits in a request, judged from the lines above it.
@@ -193,19 +255,7 @@ pub enum LineContext {
 
 /// Runs the parser over the lines before `line` and reports the state it is left in.
 pub fn line_context(text: &str, line: u32) -> LineContext {
-    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
-    let mut parser = Parser::default();
-    for (index, text) in text.lines().enumerate().take(line as usize) {
-        parser.line(index as u32, text);
-    }
-    if parser.script.is_some() {
-        return LineContext::Script;
-    }
-    match parser.state {
-        State::Preamble => LineContext::Preamble,
-        State::Url | State::Headers => LineContext::Headers,
-        State::Body | State::Handlers => LineContext::Body,
-    }
+    parse(text).line_context(line)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -393,6 +443,17 @@ struct Parser {
 }
 
 impl Parser {
+    fn context(&self) -> LineContext {
+        if self.script.is_some() {
+            return LineContext::Script;
+        }
+        match self.state {
+            State::Preamble => LineContext::Preamble,
+            State::Url | State::Headers => LineContext::Headers,
+            State::Body | State::Handlers => LineContext::Body,
+        }
+    }
+
     fn error(&mut self, line: u32, message: impl Into<String>) {
         self.document.errors.push(ParseError {
             line,
@@ -642,6 +703,7 @@ impl Parser {
     fn close_script(&mut self, script: OpenScript) {
         let parsed = Script::Inline {
             line: script.line,
+            end_line: self.last_line,
             source: script.source.trim().to_owned(),
         };
         match script.kind {
@@ -1046,7 +1108,7 @@ mod tests {
         assert_eq!(document.blocks.len(), 3);
         let block = &document.blocks[0];
         assert_eq!(block.pre_scripts.len(), 2);
-        let Script::Inline { source, line } = &block.pre_scripts[0] else {
+        let Script::Inline { source, line, .. } = &block.pre_scripts[0] else {
             panic!("expected an inline script");
         };
         assert_eq!(*line, 1);
@@ -1189,6 +1251,80 @@ mod tests {
             .errors
             .iter()
             .any(|error| error.message.contains("%}")));
+    }
+
+    #[test]
+    fn indexes_lines_with_offsets_utf16_lengths_and_contexts() {
+        let document = parse("");
+        assert_eq!(document.lines.len(), 1);
+        assert_eq!(document.line("", 0), Some(""));
+        assert_eq!(document.line_context(0), LineContext::Preamble);
+        assert_eq!(document.line_utf16_len(0), 0);
+
+        let text =
+            "\u{feff}GET https://example.test\r\nX-Ok: 1\r\n\r\nemoji 😀\r\n> {%\nlet x = 1;\n%}\n";
+        let document = parse(text);
+        assert_eq!(document.blocks.len(), 1);
+        assert_eq!(document.blocks[0].url, "https://example.test");
+        assert_eq!(
+            document.line(text, 0),
+            Some("\u{feff}GET https://example.test")
+        );
+        assert_eq!(document.line(text, 1), Some("X-Ok: 1"));
+        assert_eq!(document.line(text, 3), Some("emoji 😀"));
+        assert_eq!(document.line_utf16_len(3), 8);
+        assert_eq!(document.line(text, 7), Some(""));
+        for (line, expected) in text.lines().enumerate() {
+            assert_eq!(document.line(text, line as u32), Some(expected), "{line}");
+        }
+        assert_eq!(document.line_context(0), LineContext::Preamble);
+        assert_eq!(document.line_context(1), LineContext::Headers);
+        assert_eq!(document.line_context(3), LineContext::Body);
+        assert_eq!(document.line_context(5), LineContext::Script);
+        assert_eq!(document.line_context(7), LineContext::Body);
+        assert_eq!(document.line_context(8), LineContext::Preamble);
+        assert_eq!(document.line(text, 9), None);
+
+        let bare = parse("GET https://example.test\nline\r");
+        assert_eq!(
+            bare.line("GET https://example.test\nline\r", 1),
+            Some("line\r")
+        );
+        let crlf = parse("GET https://example.test\nline\r\n");
+        assert_eq!(
+            crlf.line("GET https://example.test\nline\r\n", 1),
+            Some("line")
+        );
+        assert_eq!(crlf.line("GET https://example.test\nline\r\n", 2), Some(""));
+    }
+
+    #[test]
+    fn indexes_large_malformed_documents_once() {
+        let mut text = "GET https://example.test\n".to_owned();
+        for _ in 0..10_000 {
+            text.push_str("not a header\n");
+        }
+        let document = parse(&text);
+        assert_eq!(document.lines.len(), 10_002);
+        assert_eq!(document.errors.len(), 10_000);
+        for (index, error) in document.errors.iter().enumerate() {
+            assert_eq!(error.line as usize, index + 1);
+            assert_eq!(document.line(&text, error.line), Some("not a header"));
+            assert_eq!(document.line_utf16_len(error.line), 12);
+            assert_eq!(document.line_context(error.line), LineContext::Headers);
+        }
+        let diagnostics = crate::assist::diagnostics(&document, &text);
+        assert_eq!(diagnostics.len(), 10_000);
+        for (index, diagnostic) in diagnostics.iter().enumerate() {
+            let line = index as u32 + 1;
+            assert_eq!(diagnostic.range.start.line, line);
+            assert_eq!(diagnostic.range.end.line, line);
+            assert_eq!(diagnostic.range.end.character, 12);
+        }
+        assert!(document
+            .error_summary()
+            .unwrap()
+            .starts_with("line 2: invalid header"));
     }
 
     #[test]

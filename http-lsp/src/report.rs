@@ -231,6 +231,67 @@ impl ScriptConsoleEntry {
     }
 }
 
+pub(crate) fn value_bytes(value: &Value) -> usize {
+    let mut bytes = std::mem::size_of::<Value>();
+    match value {
+        Value::String(text) => bytes = bytes.saturating_add(text.capacity()),
+        Value::Array(items) => {
+            bytes = bytes.saturating_add(
+                items
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            );
+            for item in items {
+                bytes = bytes.saturating_add(value_bytes(item));
+            }
+        }
+        Value::Object(map) => {
+            bytes = bytes.saturating_add(map.len().saturating_mul(
+                std::mem::size_of::<(String, Value)>() + 4 * std::mem::size_of::<usize>(),
+            ));
+            for (key, item) in map {
+                bytes = bytes
+                    .saturating_add(key.capacity())
+                    .saturating_add(value_bytes(item));
+            }
+        }
+        _ => {}
+    }
+    bytes
+}
+
+pub(crate) fn pretty_json(value: &Value, limit: usize) -> Result<String, String> {
+    struct Bounded<'a> {
+        buffer: &'a mut Vec<u8>,
+        limit: usize,
+    }
+    impl std::io::Write for Bounded<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.buffer.len() + bytes.len() > self.limit {
+                return Err(std::io::Error::other(format!(
+                    "formatted JSON exceeds {} bytes",
+                    self.limit
+                )));
+            }
+            self.buffer.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = Vec::new();
+    serde_json::to_writer_pretty(
+        Bounded {
+            buffer: &mut buffer,
+            limit,
+        },
+        value,
+    )
+    .map_err(|error| format!("could not format the body within {limit} bytes: {error}"))?;
+    String::from_utf8(buffer).map_err(|error| error.to_string())
+}
+
 pub fn value_text(value: &Value) -> String {
     match value {
         Value::String(value) => value.clone(),
@@ -325,6 +386,25 @@ mod tests {
         assert!(output.contains("# ✗ has token"));
         assert!(output.contains("# warning: unresolved variable {{missing}}"));
         assert_eq!(report.summary().failed, 1);
+    }
+
+    #[test]
+    fn pretty_json_respects_the_byte_limit() {
+        let value = json!({ "key": "value", "items": [1, 2, 3] });
+        let full = pretty_json(&value, usize::MAX).unwrap();
+        assert_eq!(full, serde_json::to_string_pretty(&value).unwrap());
+        assert!(pretty_json(&value, full.len() - 1).is_err());
+        assert_eq!(pretty_json(&value, full.len()).unwrap(), full);
+        assert!(pretty_json(&value, 4).unwrap_err().contains("4 bytes"));
+    }
+
+    #[test]
+    fn value_bytes_counts_strings_and_children() {
+        let value = json!({ "key": "abcd", "items": ["x", null] });
+        let bytes = value_bytes(&value);
+        assert!(bytes >= std::mem::size_of::<Value>() * 6, "{bytes}");
+        let empty = value_bytes(&Value::Null);
+        assert_eq!(empty, std::mem::size_of::<Value>());
     }
 
     #[test]

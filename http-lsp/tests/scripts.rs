@@ -140,6 +140,50 @@ async fn kills_scripts_past_the_wall_clock_and_keeps_working() {
 }
 
 #[tokio::test]
+async fn asynchronous_test_callbacks_fail_instead_of_passing() {
+    let engine = script_engine(Limits::default());
+    let input = ScriptInput::default();
+    for (name, source) in [
+        (
+            "asserting async",
+            "client.test('async fails', async () => { client.assert(false, 'intentional failure'); })",
+        ),
+        (
+            "resolving async",
+            "client.test('async passes', async () => true)",
+        ),
+        ("thenable", "client.test('thenable', () => ({ then() {} }))"),
+    ] {
+        let effects = engine.run(source.to_owned(), &input).await;
+        assert_eq!(effects.error, None, "{name}");
+        assert_eq!(effects.tests.len(), 1, "{name}");
+        assert!(!effects.tests[0].passed, "{name}");
+        assert!(
+            effects.tests[0]
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Asynchronous test callbacks are not supported"),
+            "{name}: {:?}",
+            effects.tests[0]
+        );
+    }
+
+    let effects = engine
+        .run(
+            "client.test('sync ok', () => client.assert(true)); \
+             client.test('sync bad', () => client.assert(false, 'sync failure'));"
+                .to_owned(),
+            &input,
+        )
+        .await;
+    assert_eq!(effects.error, None);
+    assert!(effects.tests[0].passed);
+    assert!(!effects.tests[1].passed);
+    assert_eq!(effects.tests[1].message.as_deref(), Some("sync failure"));
+}
+
+#[tokio::test]
 async fn decodes_declared_charsets_for_reports_and_scripts() {
     let address = start_server().await;
     let workspace = Workspace::new(address);
