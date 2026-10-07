@@ -1,6 +1,6 @@
 name = "http"
 grammar = "http"
-path_suffixes = ["http", "http-resp"]
+path_suffixes = ["http", "rest", "http-resp"]
 line_comments = ["# ", "// "]
 
 brackets = [

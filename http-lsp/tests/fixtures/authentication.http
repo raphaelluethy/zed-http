@@ -1,0 +1,47 @@
+# Web API with HTTP Basic + bearer token auth (JetBrains HTTP Client syntax)
+# Credentials: user / password (see api.security.* in src/main/resources/application.yaml)
+# If you change the credentials, recompute the Basic header value with:
+#   printf '%s' '<username>:<password>' | base64
+#
+# Run the login request first (or "Run All"): its response handler stores
+# the returned token in {{token}} for the bearer request below.
+
+@baseUrl = http://localhost:8080
+
+### Login - issues a bearer token, stored in {{token}} by the response handler
+POST {{baseUrl}}/api/login
+Content-Type: application/json
+
+{"username":"user","password":"password"}
+> {%
+client.test("login responds 200 with a token", function() {
+    client.assert(response.status === 200, "Expected 200 but was " + response.status);
+    client.assert(response.body.token != null, "Missing 'token' in login response");
+});
+client.global.set("token", response.body.token);
+%}
+
+### Bearer token from login - expect 200 OK
+GET {{baseUrl}}/api/editor-test
+Authorization: Bearer {{token}}
+
+### No credentials - expect 401 Unauthorized
+GET {{baseUrl}}/api/editor-test
+
+### Invalid bearer token - expect 401 Unauthorized
+GET {{baseUrl}}/api/editor-test
+Authorization: Bearer deadbeef
+
+### Wrong basic credentials - expect 401 Unauthorized
+GET {{baseUrl}}/api/editor-test
+Authorization: Basic d3Jvbmc6d3Jvbmc=
+
+### Basic credentials - expect 200 OK
+GET {{baseUrl}}/api/editor-test
+Authorization: Basic dXNlcjpwYXNzd29yZA==
+
+### Login with wrong password - expect 401 Unauthorized
+POST {{baseUrl}}/api/login
+Content-Type: application/json
+
+{"username":"user","password":"wrong"}

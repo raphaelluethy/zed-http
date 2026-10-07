@@ -38,8 +38,11 @@ Inside the binary:
 ## Features
 
 - Syntax highlighting and parse diagnostics for HTTP files
+- `.http` and `.rest` recognition, request/section/header outlines and matching variable/script delimiters
+- Request and inline-script folding through LSP (enable Zed's `document_folding_ranges` setting)
 - Completion for methods, headers and common header values, `# @` directives, `{{variables}}` (env files, file variables, `client.global` values, names set by scripts, named responses) and dynamic variables
 - Hover on `{{variable}}` showing its value, where it comes from and what it overrides
+- Documentation on common headers and request directives, plus completion and hover for the supported `client`, `request` and `response` script helpers
 - A gutter run arrow on every request that prints the response in Zed's terminal, with JSON pretty-printed and colored
 - IntelliJ-style requests:
   - `###` separators, `# @name`, request lines with an optional HTTP version, multi-line URLs and headers
@@ -68,6 +71,8 @@ Inside the binary:
 
 ### Known gaps compared to IntelliJ
 
+- This is a subset of the [JetBrains HTTP Client](https://www.jetbrains.com/help/idea/http-client-in-product-code-editor.html), not full IDE parity. There is no HTTP formatter, OpenAPI endpoint completion/refactoring, request generation from application code, cURL/Postman conversion, or built-in request templates.
+- Inline scripts have JavaScript highlighting and HTTP helper completion, but not full JavaScript type checking. ES module imports, common `={% %}` blocks, XPath and streaming response callbacks are not supported. HTTP event streams are collected until completion or a limit; there is no interactive stream/WebSocket viewer.
 - Globals, cookies and named responses are kept in memory, like session cookies, and are lost when Zed or the language server restarts. Restart the language server to start a fresh session.
 - There is no request history. `@no-log` only keeps the response body out of the terminal output.
 - Scripts have no `require`, timers, file system or network access, and cannot read environment variables. They run with a 10 second time limit.
@@ -84,6 +89,33 @@ To install a development checkout, first set it up once: run **task: spawn → z
 Click the run arrow in the gutter next to a request to send it. Zed saves the file, and the response appears in the terminal panel with its status, timing, headers, body and test results. **HTTP: Send all requests** is available through **task: spawn**. Runs share one session per workspace: a token a login handler stores with `client.global.set` is available to the next request you run. On Windows, and whenever the language server is not running, a run starts with a fresh session.
 
 Nothing is installed into the project or as a global package, and nothing needs Node.js, npm or a task shell on `PATH`.
+
+### Sign in and reuse a token
+
+Run the sign-in request first, then the authenticated request, or use **HTTP: Send all requests**:
+
+```http
+@baseUrl = http://localhost:8080
+
+### Sign in
+POST {{baseUrl}}/api/login
+Content-Type: application/json
+
+{"username":"user","password":"password"}
+> {%
+client.test("signed in", function () {
+    client.assert(response.status === 200, "Sign-in failed");
+    client.assert(response.body.token != null, "Missing token");
+});
+client.global.set("token", response.body.token);
+%}
+
+### Authenticated request
+GET {{baseUrl}}/api/editor-test
+Authorization: Bearer {{token}}
+```
+
+The token stays in the workspace language server's memory, including across separate gutter runs and files. Restarting that server clears it. If the task reports that the language server is not running, separate runs cannot share globals; start the server or use Send All. Expected `401` examples still appear as failed HTTP requests in the terminal summary; a comment such as `expect 401` does not change that status.
 
 ## Environments and state
 
@@ -153,6 +185,8 @@ For a local Zed build, point the extension at it:
   }
 }
 ```
+
+Put this in the test project's `.zed/settings.json` when testing a development checkout from another project. Otherwise, its language server uses the downloaded release while gutter tasks use the checkout's debug binary. To enable the folding ranges, add `"languages": { "http": { "document_folding_ranges": "on" } }` to the same settings object.
 
 Verify the workspace with the following commands. The integration tests start in-process servers, so they need no network access.
 
