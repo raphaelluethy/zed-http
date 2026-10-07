@@ -1,7 +1,7 @@
 id = "http"
 name = "HTTP"
 description = "JetBrains-style .http files: completion, hover and requests in the terminal"
-version = "0.1.0"
+version = "0.1.1"
 schema_version = 1
 authors = ["raphael@lty.gg"]
 repository = "https://github.com/raphaelluethy/zed-http"

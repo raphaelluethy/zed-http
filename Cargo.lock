@@ -3533,7 +3533,7 @@ dependencies = [
 
 [[package]]
 name = "zed-http-lsp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -3583,7 +3583,7 @@ dependencies = [
 
 [[package]]
 name = "zed_http"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "zed_extension_api",
 ]
