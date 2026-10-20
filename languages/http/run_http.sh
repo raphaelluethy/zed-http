@@ -1,8 +1,8 @@
 #!/bin/sh
 set -eu
 
-# The installed dev extension is a symlink to the checkout. Resolve it before
-# looking for the local build, without depending on the task shell's PATH.
+# Keep the installed path when locating Zed's download directory, including when
+# a dev extension is a symlink to a checkout.
 extension_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
 installed_root=$(CDPATH= cd -L -- "$(dirname -- "$0")/../.." && pwd -L)
 work_root=$(CDPATH= cd -L -- "$installed_root/../.." && pwd -P)/work/http
@@ -26,9 +26,6 @@ else
         adapter=$candidate
         break
     done
-    if [ -z "$adapter" ] && [ -f "$extension_root/Cargo.toml" ]; then
-        adapter=$extension_root/target/debug/zed-http-lsp
-    fi
     if [ -z "$adapter" ]; then
         case "$(uname -s):$(uname -m)" in
             Darwin:arm64) target=aarch64-apple-darwin ;;
@@ -56,7 +53,7 @@ else
     fi
 fi
 if [ ! -x "$adapter" ]; then
-    echo "zed-http: adapter not found at $adapter; open an HTTP file to install it, or build the dev adapter with cargo build --package zed-http-lsp" >&2
+    echo "zed-http: adapter not found at $adapter; open an HTTP file and wait for the extension to install its server. If you configured a custom binary path, check that it exists." >&2
     exit 1
 fi
 exec "$adapter" "$@"

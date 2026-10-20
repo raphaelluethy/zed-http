@@ -84,7 +84,9 @@ Inside the binary:
 
 ## Installation and use
 
-To install a development checkout, first set it up once: run **task: spawn → zed-http: Set up development** in this project, or `rustup toolchain install && cargo setup` in a terminal. This installs the pinned Rust toolchain with the `wasm32-wasip2` target that Zed compiles the extension with, and builds `target/debug/zed-http-lsp`, which the gutter task of a dev install runs. Zed requires Rust to be installed through [rustup](https://rustup.rs) for dev extensions. Then run **zed: install dev extension** and select this repository. When an HTTP file is first opened, the extension downloads this project's platform archive, which contains only `zed-http-lsp`. If the archive cannot be downloaded, for example while offline, the extension reuses a previously downloaded binary.
+The extension manages its own native server. When an HTTP file is first opened, it downloads this project's precompiled `zed-http-lsp` for your platform. Both language support and request tasks use that server; no Cargo build or separate runtime installation is needed. If the release cannot be downloaded, for example while offline, the extension reuses a previously downloaded binary.
+
+To install a development checkout, run **zed: install dev extension** and select this repository. Zed requires Rust to be installed through [rustup](https://rustup.rs) to compile the extension's WebAssembly component. The native server still uses the downloaded release by default. Building and selecting a local native server is only needed when developing changes to it; see **Local build** below.
 
 Click the run arrow in the gutter next to a request to send it. Zed saves the file, and the response appears in the terminal panel with its status, timing, headers, body and test results. **HTTP: Send all requests** is available through **task: spawn**. Runs share one session per workspace: a token a login handler stores with `client.global.set` is available to the next request you run. On Windows, and whenever the language server is not running, a run starts with a fresh session.
 
@@ -158,7 +160,7 @@ Release bundles are built for:
 
 ### Gutter tasks
 
-The run arrow comes from the extension's runnable query (`languages/http/runnables.scm`) and tagged task (`languages/http/tasks.json`). On macOS and Linux, the task launcher resolves the binary from Zed's installed extension without requiring it on `PATH`. A dev extension uses its checkout's `target/debug/zed-http-lsp`; a released extension uses its matching downloaded binary. Set `ZED_HTTP_LSP` in the task environment to use another binary. In this checkout, the project tasks use `cargo run` to build and start the local binary. Tasks explicitly select `/bin/sh`, so they behave the same when your default terminal shell is Fish, Bash or Zsh. File paths are passed through environment variables and quoted by the launcher command.
+The run arrow comes from the extension's runnable query (`languages/http/runnables.scm`) and tagged task (`languages/http/tasks.json`). On macOS and Linux, the task launcher resolves the binary from Zed's installed extension without requiring it on `PATH`. Both dev and released extensions use the server recorded for the workspace, or the matching downloaded binary when no active server is recorded. A checkout's debug binary is never selected implicitly. Set `ZED_HTTP_LSP` in the task environment to use another binary. Tasks explicitly select `/bin/sh`, so they behave the same when your default terminal shell is Fish, Bash or Zsh. File paths are passed through environment variables and quoted by the launcher command.
 
 JSON is indented and syntax-highlighted when stdout is a terminal. `NO_COLOR=1` disables color; `FORCE_COLOR=1` enables it for captured output.
 
@@ -186,7 +188,7 @@ For a local Zed build, point the extension at it:
 }
 ```
 
-Put this in the test project's `.zed/settings.json` when testing a development checkout from another project. Otherwise, its language server uses the downloaded release while gutter tasks use the checkout's debug binary. To enable the folding ranges, add `"languages": { "http": { "document_folding_ranges": "on" } }` to the same settings object.
+Put this in the test project's `.zed/settings.json` only when testing a local native build. Once the language server starts, gutter tasks use that same binary. Remove the override to return to the extension-managed release; avoid putting a development path in global settings, where it would affect every project and stop working after a build cleanup. To enable the folding ranges, add `"languages": { "http": { "document_folding_ranges": "on" } }` to the same settings object.
 
 Verify the workspace with the following commands. The integration tests start in-process servers, so they need no network access.
 

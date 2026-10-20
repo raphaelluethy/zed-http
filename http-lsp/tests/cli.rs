@@ -108,7 +108,7 @@ async fn asynchronous_test_callbacks_fail_the_run() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn packaged_task_finds_the_installed_dev_adapter_without_path_setup() {
+async fn packaged_task_uses_the_downloaded_adapter_without_path_setup() {
     let workspace = Workspace::new(start_server().await);
     let path = workspace.write("requests with spaces.http", "GET {{baseUrl}}/json\n");
     let installed = workspace
@@ -119,6 +119,17 @@ async fn packaged_task_finds_the_installed_dev_adapter_without_path_setup() {
         .parent()
         .unwrap();
     std::os::unix::fs::symlink(repository, installed.join("http")).unwrap();
+    let download = installed.parent().unwrap().join(format!(
+        "work/http/zed-http-lsp-{}-{}",
+        launcher_target(),
+        env!("CARGO_PKG_VERSION")
+    ));
+    std::fs::create_dir_all(&download).unwrap();
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_zed-http-lsp"),
+        download.join("zed-http-lsp"),
+    )
+    .unwrap();
     let templates: serde_json::Value =
         serde_json::from_str(include_str!("../../languages/http/tasks.json")).unwrap();
     let task = &templates[0];
@@ -364,6 +375,28 @@ async fn launcher_record_wins_over_a_dev_checkout() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "{output:?}");
     assert!(text.contains("adapter recorded"), "{text}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn launcher_dev_checkout_uses_download_without_a_local_build() {
+    let workspace = Workspace::new(start_server().await);
+    let home = launcher_home(&workspace);
+    let installed = home
+        .root
+        .join("Library/Application Support/Zed/extensions/installed/http");
+    // Move the fixture outside Zed's tree to reproduce a dev-extension symlink.
+    let checkout = workspace.root.join("dev checkout");
+    std::fs::rename(&installed, &checkout).unwrap();
+    std::fs::write(checkout.join("Cargo.toml"), "[workspace]\n").unwrap();
+    std::os::unix::fs::symlink(&checkout, &installed).unwrap();
+    home.write_adapter(&format!("zed-http-lsp-{}-9.9.9", launcher_target()));
+
+    let output = run_launcher_task(&workspace, &home, &[]).await;
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    assert!(text.contains("9.9.9"), "{text}");
+    assert!(!checkout.join("target").exists());
 }
 
 /// Starts the language server for `root` and waits until it has answered `initialize` and
